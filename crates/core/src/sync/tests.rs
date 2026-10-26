@@ -1,0 +1,888 @@
+//! End-to-end sync scenarios against an in-memory server that follows `docs/sync.md`.
+
+use std::collections::{BTreeMap, BTreeSet};
+
+use uuid::Uuid;
+
+use super::*;
+use crate::{
+    account::UnlockedAccount,
+    api::*,
+    content::seal_vault,
+    envelope::AttachmentKind,
+    keys::{AccountKey, PublicKey, UserKeyPair},
+    payload::{MemoPayload, VaultPayload},
+    share::{KeyGrant, wrap_memo_key},
+};
+
+// ---- Reference server ----
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+enum Entity {
+    Memo(Uuid),
+    Access(Uuid),
+    Attachment(Uuid),
+    State(Uuid),
+    Vault,
+}
+
+#[derive(Clone, Debug)]
+struct ServerMemo {
+    owner: Uuid,
+    version: u64,
+    key_version: u32,
+    ciphertext: Option<Vec<u8>>,
+    updated_by: Option<Uuid>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct ServerAttachment {
+    memo_id: Uuid,
+    uploaded: bool,
+    thumb_uploaded: bool,
+    deleted: bool,
+}
+
+#[derive(Clone, Debug)]
+struct Server {
+    epoch: String,
+    seq: u64,
+    page_limit: usize,
+    users: BTreeMap<Uuid, (String, PublicKey)>,
+    memos: BTreeMap<Uuid, ServerMemo>,
+    members: BTreeMap<(Uuid, Uuid), Permission>,
+    keys: BTreeMap<(Uuid, Uuid, u32), Vec<u8>>,
+    states: BTreeMap<(Uuid, Uuid), (bool, bool)>,
+    attachments: BTreeMap<Uuid, ServerAttachment>,
+    vaults: BTreeMap<Uuid, (u64, Vec<u8>)>,
+    log: BTreeMap<(Uuid, Entity), u64>,
+    /// One value for all users is enough here.
+    purged_through: u64,
+}
+
+impl Server {
+    fn new() -> Self {
+        Self {
+            epoch: "epoch-1".into(),
+            seq: 0,
+            page_limit: 500,
+            users: BTreeMap::new(),
+            memos: BTreeMap::new(),
+            members: BTreeMap::new(),
+            keys: BTreeMap::new(),
+            states: BTreeMap::new(),
+            attachments: BTreeMap::new(),
+            vaults: BTreeMap::new(),
+            log: BTreeMap::new(),
+            purged_through: 0,
+        }
+    }
+
+    fn register(&mut self, name: &str, account: &UnlockedAccount) {
+        self.users.insert(account.user_id, (name.into(), *account.keypair.public_key()));
+        let vault = seal_vault(&account.account_key, account.user_id, 1, &VaultPayload::default()).unwrap();
+        self.vaults.insert(account.user_id, (1, vault));
+        self.fan_out(Entity::Vault, [account.user_id]);
+    }
+
+    fn fan_out(&mut self, entity: Entity, users: impl IntoIterator<Item = Uuid>) {
+        self.seq += 1;
+        for user in users {
+            self.log.insert((user, entity), self.seq);
+        }
+    }
+
+    fn members_of(&self, memo_id: Uuid) -> Vec<Uuid> {
+        self.members.keys().filter(|(m, _)| *m == memo_id).map(|(_, u)| *u).collect()
+    }
+
+    fn permission(&self, memo_id: Uuid, user: Uuid) -> Option<Permission> {
+        self.members.get(&(memo_id, user)).copied()
+    }
+
+    fn sync(&mut self, user: Uuid, request: &SyncRequest) -> SyncResponse {
+        let reset = request.epoch.as_ref().is_some_and(|e| *e != self.epoch)
+            || (request.cursor > 0 && request.cursor < self.purged_through)
+            || request.cursor > self.seq;
+        if reset {
+            return SyncResponse {
+                results: vec![],
+                changes: vec![],
+                cursor: 0,
+                epoch: self.epoch.clone(),
+                more: false,
+                reset: true,
+            };
+        }
+        let results = request.push.iter().map(|op| self.apply(user, op)).collect();
+
+        let mut rows: Vec<(u64, Entity)> = self
+            .log
+            .iter()
+            .filter(|((u, _), seq)| *u == user && **seq > request.cursor)
+            .map(|((_, e), s)| (*s, *e))
+            .collect();
+        rows.sort();
+        // A full sync starts with the vault, so clients know their pins before verifying keys.
+        if request.cursor == 0
+            && let Some(pos) = rows.iter().position(|(_, e)| *e == Entity::Vault)
+        {
+            let vault = rows.remove(pos);
+            rows.insert(0, vault);
+        }
+        let more = rows.len() > self.page_limit;
+        rows.truncate(self.page_limit);
+        let cursor = if more {
+            rows.iter()
+                .filter(|(_, e)| *e != Entity::Vault || request.cursor > 0)
+                .map(|(s, _)| *s)
+                .max()
+                .unwrap_or(request.cursor)
+        } else {
+            self.log.iter().filter(|((u, _), _)| *u == user).map(|(_, s)| *s).max().unwrap_or(0).max(request.cursor)
+        };
+        let changes = rows.into_iter().map(|(seq, entity)| self.render(user, seq, entity)).collect();
+        SyncResponse { results, changes, cursor, epoch: self.epoch.clone(), more, reset: false }
+    }
+
+    fn render(&self, user: Uuid, seq: u64, entity: Entity) -> Change {
+        match entity {
+            Entity::Memo(id) => {
+                let m = &self.memos[&id];
+                Change::Memo(MemoChange {
+                    seq,
+                    id,
+                    owner_id: m.owner,
+                    version: m.version,
+                    key_version: m.key_version,
+                    deleted: m.ciphertext.is_none(),
+                    ciphertext: m.ciphertext.clone(),
+                    created_at: 0,
+                    updated_at: 0,
+                    updated_by: m.updated_by,
+                })
+            }
+            Entity::Access(memo_id) => match self.permission(memo_id, user) {
+                None => Change::Access(AccessChange {
+                    seq,
+                    memo_id,
+                    revoked: true,
+                    owner_id: None,
+                    permission: None,
+                    keys: vec![],
+                    members: vec![],
+                }),
+                Some(permission) => Change::Access(AccessChange {
+                    seq,
+                    memo_id,
+                    revoked: false,
+                    owner_id: Some(self.memos[&memo_id].owner),
+                    permission: Some(permission),
+                    keys: self
+                        .keys
+                        .iter()
+                        .filter(|((m, u, _), _)| *m == memo_id && *u == user)
+                        .map(|((_, _, kv), wk)| WrappedKey { key_version: *kv, wrapped_key: wk.clone() })
+                        .collect(),
+                    members: self
+                        .members_of(memo_id)
+                        .into_iter()
+                        .map(|u| Member {
+                            user_id: u,
+                            username: self.users[&u].0.clone(),
+                            public_key: self.users[&u].1,
+                            permission: self.members[&(memo_id, u)],
+                        })
+                        .collect(),
+                }),
+            },
+            Entity::Attachment(id) => {
+                let a = &self.attachments[&id];
+                Change::Attachment(AttachmentChange {
+                    seq,
+                    id,
+                    memo_id: a.memo_id,
+                    size: None,
+                    thumb_size: None,
+                    uploaded: a.uploaded,
+                    thumb_uploaded: a.thumb_uploaded,
+                    deleted: a.deleted,
+                })
+            }
+            Entity::State(memo_id) => {
+                let (pinned, archived) = self.states[&(memo_id, user)];
+                Change::State(StateChange { seq, memo_id, pinned, archived })
+            }
+            Entity::Vault => {
+                let (version, ciphertext) = self.vaults[&user].clone();
+                Change::Vault(VaultChange { seq, version, ciphertext })
+            }
+        }
+    }
+
+    fn apply(&mut self, user: Uuid, op: &PushOp) -> OpResult {
+        let ok = |version| OpResult { status: OpStatus::Ok, version, current_version: None };
+        match op {
+            PushOp::MemoPut { id, base_version, key_version, ciphertext, wrapped_key } => {
+                let Some(memo) = self.memos.get(id) else {
+                    if *base_version != 0 || *key_version != 1 || wrapped_key.is_none() {
+                        return OpResult::status(if *base_version != 0 {
+                            OpStatus::NotFound
+                        } else {
+                            OpStatus::Invalid
+                        });
+                    }
+                    let memo = ServerMemo {
+                        owner: user,
+                        version: 1,
+                        key_version: 1,
+                        ciphertext: Some(ciphertext.clone()),
+                        updated_by: Some(user),
+                    };
+                    self.memos.insert(*id, memo);
+                    self.members.insert((*id, user), Permission::Write);
+                    self.keys.insert((*id, user, 1), wrapped_key.clone().unwrap());
+                    self.fan_out(Entity::Access(*id), [user]);
+                    self.fan_out(Entity::Memo(*id), [user]);
+                    return ok(Some(1));
+                };
+                if memo.ciphertext.is_none() && self.log.contains_key(&(user, Entity::Memo(*id))) {
+                    return OpResult::status(OpStatus::Deleted);
+                }
+                let Some(permission) = self.permission(*id, user) else { return OpResult::status(OpStatus::NotFound) };
+                let current = Some(memo.version);
+                if *base_version == 0 {
+                    return OpResult { status: OpStatus::Conflict, version: None, current_version: current };
+                }
+                if permission != Permission::Write {
+                    return OpResult::status(OpStatus::Forbidden);
+                }
+                if *base_version != memo.version || *key_version != memo.key_version {
+                    return OpResult { status: OpStatus::Conflict, version: None, current_version: current };
+                }
+                let memo = self.memos.get_mut(id).unwrap();
+                memo.version += 1;
+                memo.ciphertext = Some(ciphertext.clone());
+                memo.updated_by = Some(user);
+                let version = memo.version;
+                self.fan_out(Entity::Memo(*id), self.members_of(*id));
+                ok(Some(version))
+            }
+            PushOp::MemoDelete { id, base_version } => {
+                let Some(memo) = self.memos.get(id).cloned() else { return OpResult::status(OpStatus::NotFound) };
+                if memo.ciphertext.is_none() {
+                    return ok(None);
+                }
+                if self.permission(*id, user).is_none() {
+                    return OpResult::status(OpStatus::NotFound);
+                }
+                if memo.owner != user {
+                    return OpResult::status(OpStatus::Forbidden);
+                }
+                if *base_version != memo.version {
+                    return OpResult { status: OpStatus::Conflict, version: None, current_version: Some(memo.version) };
+                }
+                let former = self.members_of(*id);
+                self.memos.get_mut(id).unwrap().ciphertext = None;
+                self.members.retain(|(m, _), _| m != id);
+                self.keys.retain(|(m, _, _), _| m != id);
+                self.states.retain(|(m, _), _| m != id);
+                for (attachment_id, a) in self.attachments.iter_mut().filter(|(_, a)| a.memo_id == *id) {
+                    a.deleted = true;
+                    self.seq += 1;
+                    for u in &former {
+                        self.log.insert((*u, Entity::Attachment(*attachment_id)), self.seq);
+                    }
+                }
+                self.fan_out(Entity::Memo(*id), former);
+                ok(None)
+            }
+            PushOp::StatePut { memo_id, pinned, archived } => {
+                if self.permission(*memo_id, user).is_none() {
+                    return OpResult::status(OpStatus::NotFound);
+                }
+                self.states.insert((*memo_id, user), (*pinned, *archived));
+                self.fan_out(Entity::State(*memo_id), [user]);
+                ok(None)
+            }
+            PushOp::AttachmentDelete { id } => {
+                let Some(a) = self.attachments.get(id).cloned() else { return ok(None) };
+                if self.permission(a.memo_id, user) != Some(Permission::Write) {
+                    return OpResult::status(OpStatus::Forbidden);
+                }
+                self.attachments.get_mut(id).unwrap().deleted = true;
+                self.fan_out(Entity::Attachment(*id), self.members_of(a.memo_id));
+                ok(None)
+            }
+            PushOp::VaultPut { base_version, ciphertext } => {
+                let (version, _) = self.vaults[&user];
+                if *base_version != version {
+                    return OpResult { status: OpStatus::Conflict, version: None, current_version: Some(version) };
+                }
+                self.vaults.insert(user, (version + 1, ciphertext.clone()));
+                self.fan_out(Entity::Vault, [user]);
+                ok(Some(version + 1))
+            }
+        }
+    }
+
+    fn add_member(&mut self, owner: Uuid, memo_id: Uuid, request: &AddMemberRequest) {
+        assert_eq!(self.memos[&memo_id].owner, owner);
+        self.members.insert((memo_id, request.user_id), request.permission);
+        for key in &request.keys {
+            self.keys.insert((memo_id, request.user_id, key.key_version), key.wrapped_key.clone());
+        }
+        self.fan_out(Entity::Access(memo_id), self.members_of(memo_id));
+        self.fan_out(Entity::Memo(memo_id), [request.user_id]);
+    }
+
+    fn revoke(&mut self, owner: Uuid, memo_id: Uuid, request: &RevokeRequest) -> RevokeResponse {
+        let memo = self.memos.get_mut(&memo_id).unwrap();
+        assert_eq!(memo.owner, owner);
+        assert_eq!(memo.version, request.base_version);
+        memo.version += 1;
+        memo.key_version = request.new_key_version;
+        memo.ciphertext = Some(request.ciphertext.clone());
+        let version = memo.version;
+        let everyone = self.members_of(memo_id);
+        self.members.retain(|(m, u), _| *m != memo_id || !request.user_ids.contains(u));
+        self.keys.retain(|(m, u, _), _| *m != memo_id || !request.user_ids.contains(u));
+        for key in &request.keys {
+            self.keys.insert((memo_id, key.user_id, request.new_key_version), key.wrapped_key.clone());
+        }
+        self.fan_out(Entity::Access(memo_id), everyone);
+        self.fan_out(Entity::Memo(memo_id), self.members_of(memo_id));
+        RevokeResponse { version }
+    }
+
+    fn upload(&mut self, upload: &Upload) {
+        let a = self
+            .attachments
+            .entry(upload.attachment_id)
+            .or_insert(ServerAttachment { memo_id: upload.memo_id, ..Default::default() });
+        match upload.kind {
+            AttachmentKind::Original => a.uploaded = true,
+            AttachmentKind::Thumbnail => a.thumb_uploaded = true,
+        }
+        self.fan_out(Entity::Attachment(upload.attachment_id), self.members_of(upload.memo_id));
+    }
+}
+
+// ---- Devices ----
+
+struct Device {
+    store: MemoryStore,
+    account: UnlockedAccount,
+}
+
+impl Device {
+    fn new(account: &UnlockedAccount) -> Self {
+        Self { store: MemoryStore::new(), account: account.clone() }
+    }
+
+    fn sync(&mut self, server: &mut Server) -> Vec<SyncEvent> {
+        let mut session = SyncSession::start(&mut self.store, &self.account, 1000).unwrap();
+        loop {
+            let response = server.sync(self.account.user_id, session.request());
+            if session.handle(&mut self.store, &self.account, response).unwrap() == Step::Done {
+                break;
+            }
+        }
+        for upload in pending_uploads(&self.store).unwrap() {
+            assert!(self.store.blob(upload.attachment_id, upload.kind).unwrap().is_some());
+            server.upload(&upload);
+            upload_done(&mut self.store, upload.attachment_id, upload.kind).unwrap();
+        }
+        session.into_report().events
+    }
+
+    fn create(&mut self, body: &str) -> Uuid {
+        create_memo(&mut self.store, &self.account, MemoPayload::new(body, 1), 1).unwrap()
+    }
+
+    fn edit(&mut self, id: Uuid, body: &str) {
+        let mut payload = self.memo(id).current().unwrap().clone();
+        payload.body = body.into();
+        edit_memo(&mut self.store, id, payload).unwrap();
+    }
+
+    fn memo(&self, id: Uuid) -> MemoRecord {
+        self.store.memo(id).unwrap().expect("memo exists")
+    }
+
+    fn body(&self, id: Uuid) -> String {
+        self.memo(id).current().unwrap().body.clone()
+    }
+
+    fn memo_ids(&self) -> Vec<Uuid> {
+        self.store.memo_ids().unwrap()
+    }
+}
+
+fn user(server: &mut Server, name: &str) -> UnlockedAccount {
+    let account = UnlockedAccount {
+        user_id: Uuid::now_v7(),
+        account_key: AccountKey::generate(),
+        keypair: UserKeyPair::generate(),
+    };
+    server.register(name, &account);
+    account
+}
+
+fn clean(device: &Device, id: Uuid) -> bool {
+    !device.memo(id).is_dirty()
+}
+
+// ---- Scenarios ----
+
+#[test]
+fn second_device_receives_memos() {
+    let mut server = Server::new();
+    let alice = user(&mut server, "alice");
+    let (mut a1, mut a2) = (Device::new(&alice), Device::new(&alice));
+    let id = a1.create("hello");
+    assert!(a1.sync(&mut server).is_empty());
+    assert!(clean(&a1, id));
+    assert_eq!(a1.memo(id).server_version, 1);
+
+    assert!(a2.sync(&mut server).is_empty());
+    assert_eq!(a2.body(id), "hello");
+    assert!(clean(&a2, id));
+    assert_eq!(server.memos[&id].version, 1);
+}
+
+#[test]
+fn concurrent_edits_merge() {
+    let mut server = Server::new();
+    let alice = user(&mut server, "alice");
+    let (mut a1, mut a2) = (Device::new(&alice), Device::new(&alice));
+    let id = a1.create("one\ntwo\nthree\n");
+    a1.sync(&mut server);
+    a2.sync(&mut server);
+
+    a1.edit(id, "ONE\ntwo\nthree\n");
+    a2.edit(id, "one\ntwo\nTHREE\n");
+    a1.sync(&mut server);
+    assert!(a2.sync(&mut server).is_empty());
+    assert_eq!(a2.body(id), "ONE\ntwo\nTHREE\n");
+    assert!(clean(&a2, id), "the merge was pushed in the same session");
+    a1.sync(&mut server);
+    assert_eq!(a1.body(id), "ONE\ntwo\nTHREE\n");
+    assert_eq!(server.memos[&id].version, 3);
+}
+
+#[test]
+fn overlapping_edits_wait_for_the_user() {
+    let mut server = Server::new();
+    let alice = user(&mut server, "alice");
+    let (mut a1, mut a2) = (Device::new(&alice), Device::new(&alice));
+    let id = a1.create("shopping");
+    a1.sync(&mut server);
+    a2.sync(&mut server);
+
+    a1.edit(id, "shopping: milk");
+    a2.edit(id, "shopping: eggs");
+    a1.sync(&mut server);
+    assert_eq!(a2.sync(&mut server), vec![SyncEvent::Conflict { memo_id: id }]);
+    let conflict = a2.memo(id).conflict.unwrap();
+    assert_eq!(conflict.theirs.body, "shopping: milk");
+    assert_eq!(a2.body(id), "shopping: eggs");
+    assert_eq!(edit_memo(&mut a2.store, id, MemoPayload::new("x", 2)), Err(crate::Error::InConflict));
+
+    let mut resolved = conflict.theirs.clone();
+    resolved.body = "shopping: milk, eggs".into();
+    resolve_conflict(&mut a2.store, id, resolved).unwrap();
+    a2.sync(&mut server);
+    a1.sync(&mut server);
+    assert_eq!(a1.body(id), "shopping: milk, eggs");
+    assert!(clean(&a1, id) && clean(&a2, id));
+}
+
+#[test]
+fn lost_response_is_recognised_as_our_own_write() {
+    let mut server = Server::new();
+    let alice = user(&mut server, "alice");
+    let mut a1 = Device::new(&alice);
+    let id = a1.create("draft");
+    a1.sync(&mut server);
+
+    a1.edit(id, "draft two");
+    let session = SyncSession::start(&mut a1.store, &a1.account, 1000).unwrap();
+    server.sync(alice.user_id, session.request()); // applied, but the response never arrives
+    drop(session);
+    a1.edit(id, "draft two, continued");
+
+    assert!(a1.sync(&mut server).is_empty(), "no conflict with ourselves");
+    assert!(clean(&a1, id));
+    assert_eq!(a1.memo(id).server_version, 3);
+    let mut a2 = Device::new(&alice);
+    a2.sync(&mut server);
+    assert_eq!(a2.body(id), "draft two, continued");
+}
+
+#[test]
+fn lost_create_response_does_not_duplicate() {
+    let mut server = Server::new();
+    let alice = user(&mut server, "alice");
+    let mut a1 = Device::new(&alice);
+    let id = a1.create("new");
+    let session = SyncSession::start(&mut a1.store, &a1.account, 1000).unwrap();
+    server.sync(alice.user_id, session.request());
+    drop(session);
+    assert!(a1.sync(&mut server).is_empty());
+    assert!(clean(&a1, id));
+    assert_eq!(server.memos.len(), 1);
+    assert_eq!(server.memos[&id].version, 1);
+}
+
+fn share(server: &mut Server, owner: &mut Device, id: Uuid, with: &UnlockedAccount, permission: Permission) {
+    let info = UserInfo {
+        user_id: with.user_id,
+        username: server.users[&with.user_id].0.clone(),
+        public_key: *with.keypair.public_key(),
+    };
+    let request = prepare_share(&mut owner.store, &owner.account, id, &info, permission, 5).unwrap();
+    server.add_member(owner.account.user_id, id, &request);
+}
+
+#[test]
+fn share_edit_and_revoke() {
+    let mut server = Server::new();
+    let (alice, bob) = (user(&mut server, "alice"), user(&mut server, "bob"));
+    let (mut a, mut b) = (Device::new(&alice), Device::new(&bob));
+    let id = a.create("plans");
+    a.sync(&mut server);
+    share(&mut server, &mut a, id, &bob, Permission::Write);
+    a.sync(&mut server);
+
+    assert!(b.sync(&mut server).is_empty());
+    assert_eq!(b.body(id), "plans");
+    let pins = b.store.vault().unwrap().unwrap().current().contacts.clone();
+    assert_eq!(pins[&alice.user_id].public_key, *alice.keypair.public_key(), "bob pinned alice on first use");
+    assert!(b.store.vault().unwrap().unwrap().local.is_none(), "and synced the pin");
+
+    b.edit(id, "plans\nbob was here");
+    b.sync(&mut server);
+    a.sync(&mut server);
+    assert_eq!(a.body(id), "plans\nbob was here");
+
+    // Bob edits offline while Alice revokes him.
+    b.edit(id, "plans\nbob was here\nmore");
+    let prepared = prepare_revoke(&a.store, &a.account, id, &[bob.user_id]).unwrap();
+    let response = server.revoke(alice.user_id, id, &prepared.request);
+    apply_revoke(&mut a.store, prepared, response).unwrap();
+    a.sync(&mut server);
+    assert_eq!(a.memo(id).key_version, 2);
+    a.edit(id, "plans (private again)");
+    a.sync(&mut server);
+    assert!(clean(&a, id));
+
+    let events = b.sync(&mut server);
+    let [SyncEvent::RestoredCopy { original, copy, reason: CopyReason::AccessRevoked }] = events[..] else {
+        panic!("{events:?}")
+    };
+    assert_eq!(original, id);
+    assert!(b.store.memo(id).unwrap().is_none());
+    assert_eq!(b.body(copy), "plans\nbob was here\nmore");
+    assert!(clean(&b, copy), "the copy was pushed as bob's own memo");
+    assert_eq!(server.memos[&copy].owner, bob.user_id);
+}
+
+#[test]
+fn read_only_members_cannot_edit() {
+    let mut server = Server::new();
+    let (alice, bob) = (user(&mut server, "alice"), user(&mut server, "bob"));
+    let (mut a, mut b) = (Device::new(&alice), Device::new(&bob));
+    let id = a.create("read me");
+    a.sync(&mut server);
+    share(&mut server, &mut a, id, &bob, Permission::Read);
+    b.sync(&mut server);
+    assert_eq!(b.body(id), "read me");
+    assert_eq!(edit_memo(&mut b.store, id, MemoPayload::new("nope", 2)), Err(crate::Error::ReadOnly));
+    assert_eq!(delete_memo(&mut b.store, &b.account, id), Err(crate::Error::NotOwner));
+    let copy = save_as_copy(&mut b.store, &b.account, id, 9).unwrap();
+    b.sync(&mut server);
+    assert_eq!(server.memos[&copy].owner, bob.user_id);
+}
+
+#[test]
+fn forged_keys_are_rejected() {
+    let mut server = Server::new();
+    let (alice, bob) = (user(&mut server, "alice"), user(&mut server, "bob"));
+    let (mut a, mut b) = (Device::new(&alice), Device::new(&bob));
+    let id = a.create("secret");
+    a.sync(&mut server);
+    share(&mut server, &mut a, id, &bob, Permission::Write);
+    b.sync(&mut server);
+
+    // The server invents a memo "from alice" with a key it wrapped itself.
+    let mallory = UserKeyPair::generate();
+    let fake = Uuid::now_v7();
+    let fake_key = crate::keys::MemoKey::generate();
+    let grant = KeyGrant { memo_id: fake, key_version: 1, owner_id: alice.user_id, member_id: bob.user_id };
+    let ctx = crate::content::MemoContext { memo_id: fake, version: 1, key_version: 1 };
+    let ciphertext = crate::content::seal_memo(&fake_key, &ctx, &MemoPayload::new("click here", 1)).unwrap();
+    server.memos.insert(
+        fake,
+        ServerMemo { owner: alice.user_id, version: 1, key_version: 1, ciphertext: Some(ciphertext), updated_by: None },
+    );
+    server.members.insert((fake, alice.user_id), Permission::Write);
+    server.members.insert((fake, bob.user_id), Permission::Write);
+    server
+        .keys
+        .insert((fake, bob.user_id, 1), wrap_memo_key(&mallory, b.account.keypair.public_key(), &grant, &fake_key));
+    server.fan_out(Entity::Access(fake), [bob.user_id]);
+    server.fan_out(Entity::Memo(fake), [bob.user_id]);
+
+    let events = b.sync(&mut server);
+    assert_eq!(events, vec![SyncEvent::KeyRejected { memo_id: fake, owner_id: alice.user_id }]);
+    let memo = b.memo(fake);
+    assert!(memo.base.is_none());
+    assert_eq!(memo.undecoded.unwrap().reason, UndecodedReason::MissingKey);
+
+    // The server now claims alice has another public key: the pin wins and the alarm goes off.
+    server.users.get_mut(&alice.user_id).unwrap().1 = *mallory.public_key();
+    server.fan_out(Entity::Access(id), [bob.user_id]);
+    assert_eq!(b.sync(&mut server), vec![SyncEvent::KeyChanged { user_id: alice.user_id }]);
+    let info = UserInfo { user_id: alice.user_id, username: "alice".into(), public_key: *mallory.public_key() };
+    assert_eq!(
+        prepare_share(&mut b.store, &b.account, Uuid::now_v7(), &info, Permission::Read, 1).unwrap_err(),
+        crate::Error::NotFound
+    );
+    let own = b.create("mine");
+    b.sync(&mut server);
+    assert_eq!(
+        prepare_share(&mut b.store, &b.account, own, &info, Permission::Read, 1).unwrap_err(),
+        crate::Error::KeyChanged(alice.user_id)
+    );
+}
+
+#[test]
+fn delete_and_edit_race() {
+    let mut server = Server::new();
+    let alice = user(&mut server, "alice");
+    let (mut a1, mut a2) = (Device::new(&alice), Device::new(&alice));
+    let first = a1.create("first");
+    let second = a1.create("second");
+    a1.sync(&mut server);
+    a2.sync(&mut server);
+
+    // Delete wins on the server, the offline edit becomes a copy.
+    delete_memo(&mut a1.store, &a1.account, first).unwrap();
+    a2.edit(first, "first, edited");
+    a1.sync(&mut server);
+    assert!(a1.store.memo(first).unwrap().is_none());
+    let events = a2.sync(&mut server);
+    let [SyncEvent::RestoredCopy { copy, reason: CopyReason::Deleted, .. }] = events[..] else { panic!("{events:?}") };
+    assert_eq!(a2.body(copy), "first, edited");
+
+    // The edit wins on the server, the delete is cancelled.
+    a2.edit(second, "second, edited");
+    a2.sync(&mut server);
+    delete_memo(&mut a1.store, &a1.account, second).unwrap();
+    assert_eq!(a1.sync(&mut server), vec![SyncEvent::DeleteRejected { memo_id: second }]);
+    assert_eq!(a1.body(second), "second, edited");
+    assert!(server.memos[&second].ciphertext.is_some());
+}
+
+#[test]
+fn reset_after_restore_pushes_lost_data_back() {
+    let mut server = Server::new();
+    let alice = user(&mut server, "alice");
+    let (mut a1, mut a2) = (Device::new(&alice), Device::new(&alice));
+    let kept = a1.create("kept");
+    a1.sync(&mut server);
+    let backup = server.clone();
+
+    a1.edit(kept, "kept, newer");
+    let lost = a1.create("only after the backup");
+    a1.sync(&mut server);
+    a2.sync(&mut server);
+
+    server = Server { epoch: "epoch-2".into(), ..backup };
+    let events = a1.sync(&mut server);
+    assert!(events.contains(&SyncEvent::Reset));
+    assert!(events.contains(&SyncEvent::ServerLostData { memo_id: kept }));
+    assert_eq!(a1.body(kept), "kept, newer");
+    assert!(clean(&a1, kept) && clean(&a1, lost));
+    assert!(server.memos.contains_key(&lost), "unknown to the server, so it went back up as a memo");
+
+    // a2 had the same newer data; after its reset everything agrees.
+    let events = a2.sync(&mut server);
+    assert!(events.contains(&SyncEvent::Reset));
+    assert_eq!(a2.body(kept), "kept, newer");
+    assert!(clean(&a2, kept));
+    assert_eq!(a2.memo_ids().len(), 2);
+}
+
+#[test]
+fn reset_after_restore_recreates_own_memos() {
+    let mut server = Server::new();
+    let alice = user(&mut server, "alice");
+    let mut a1 = Device::new(&alice);
+    a1.sync(&mut server);
+    let backup = server.clone();
+    let id = a1.create("synced after the backup");
+    a1.sync(&mut server);
+    let unsynced = a1.create("never synced");
+
+    server = Server { epoch: "epoch-2".into(), ..backup };
+    let events = a1.sync(&mut server);
+    assert!(events.contains(&SyncEvent::ServerLostData { memo_id: id }));
+    assert_eq!(server.memos[&id].version, 1, "same id, created again");
+    assert_eq!(a1.body(id), "synced after the backup");
+    assert!(clean(&a1, id) && clean(&a1, unsynced));
+}
+
+#[test]
+fn reset_after_long_offline_drops_purged_memos() {
+    let mut server = Server::new();
+    let alice = user(&mut server, "alice");
+    let (mut a1, mut a2) = (Device::new(&alice), Device::new(&alice));
+    let (gone, edited, kept) = (a1.create("gone"), a1.create("edited"), a1.create("kept"));
+    a1.sync(&mut server);
+    a2.sync(&mut server);
+
+    delete_memo(&mut a1.store, &a1.account, gone).unwrap();
+    delete_memo(&mut a1.store, &a1.account, edited).unwrap();
+    a1.sync(&mut server);
+    a2.edit(edited, "edited offline");
+    // Months later the tombstones are purged.
+    server.log.retain(|(_, e), _| *e != Entity::Memo(gone) && *e != Entity::Memo(edited));
+    server.purged_through = server.seq;
+    server.fan_out(Entity::Vault, [alice.user_id]);
+
+    let events = a2.sync(&mut server);
+    assert!(events.contains(&SyncEvent::Reset));
+    assert!(a2.store.memo(gone).unwrap().is_none());
+    assert!(a2.store.memo(edited).unwrap().is_none());
+    let copy = events.iter().find_map(|e| match e {
+        SyncEvent::RestoredCopy { original, copy, .. } if *original == edited => Some(*copy),
+        _ => None,
+    });
+    assert_eq!(a2.body(copy.unwrap()), "edited offline");
+    assert_eq!(a2.body(kept), "kept");
+}
+
+#[test]
+fn paging() {
+    let mut server = Server::new();
+    server.page_limit = 2;
+    let alice = user(&mut server, "alice");
+    let (mut a1, mut a2) = (Device::new(&alice), Device::new(&alice));
+    for i in 0..5 {
+        a1.create(&format!("memo {i}"));
+    }
+    a1.sync(&mut server);
+    a2.sync(&mut server);
+    assert_eq!(a2.memo_ids().len(), 5);
+    assert!(a2.memo_ids().iter().all(|id| a2.memo(*id).base.is_some()));
+    assert_eq!(a2.store.meta().unwrap().cursor, server.seq);
+}
+
+#[test]
+fn attachments_upload_and_release() {
+    let mut server = Server::new();
+    let alice = user(&mut server, "alice");
+    let (mut a1, mut a2) = (Device::new(&alice), Device::new(&alice));
+    let id = a1.create("photo");
+    let thumbnail = NewThumbnail { mime: "image/webp".into(), width: 2, height: 1, bytes: b"thumb" };
+    let new = NewAttachment {
+        mime: "image/jpeg".into(),
+        width: 4,
+        height: 2,
+        bytes: b"jpeg bytes",
+        thumbnail: Some(thumbnail),
+    };
+    let attachment = add_attachment(&mut a1.store, id, new).unwrap();
+    let mut payload = a1.memo(id).current().unwrap().clone();
+    assert_eq!(payload.attachments, vec![attachment.clone()]);
+    payload.body = format!("![](attachment:{})", attachment.id);
+    edit_memo(&mut a1.store, id, payload.clone()).unwrap();
+
+    assert!(pending_uploads(&a1.store).unwrap().is_empty(), "not before the memo exists on the server");
+    a1.sync(&mut server);
+    assert!(server.attachments[&attachment.id].uploaded && server.attachments[&attachment.id].thumb_uploaded);
+    assert!(pending_uploads(&a1.store).unwrap().is_empty());
+
+    a2.sync(&mut server);
+    let record = a2.store.attachment(attachment.id).unwrap().unwrap();
+    assert!(record.uploaded && record.thumb_uploaded);
+    assert_eq!(cached_attachment(&a2.store, &attachment, AttachmentKind::Original).unwrap(), None);
+    let envelope = a1.store.blob(attachment.id, AttachmentKind::Original).unwrap().unwrap(); // "download"
+    a2.store.put_blob(attachment.id, AttachmentKind::Original, &envelope).unwrap();
+    assert_eq!(cached_attachment(&a2.store, &attachment, AttachmentKind::Original).unwrap().unwrap(), b"jpeg bytes");
+
+    payload.attachments.clear();
+    payload.body = "no photo".into();
+    edit_memo(&mut a1.store, id, payload).unwrap();
+    a1.sync(&mut server);
+    assert!(server.attachments[&attachment.id].deleted);
+    assert!(a1.store.attachment(attachment.id).unwrap().is_none());
+    a2.sync(&mut server);
+    assert!(a2.store.attachment(attachment.id).unwrap().is_none());
+    assert!(a2.store.blob(attachment.id, AttachmentKind::Original).unwrap().is_none());
+}
+
+#[test]
+fn states_and_vault_settings_sync() {
+    let mut server = Server::new();
+    let alice = user(&mut server, "alice");
+    let (mut a1, mut a2) = (Device::new(&alice), Device::new(&alice));
+    let id = a1.create("pin me");
+    set_memo_state(&mut a1.store, id, true, false).unwrap();
+    a1.sync(&mut server);
+    a2.sync(&mut server);
+    assert_eq!(
+        a2.store.state(id).unwrap().unwrap(),
+        StateRecord { memo_id: id, pinned: true, archived: false, dirty: false }
+    );
+
+    // Both devices change the vault: contacts union, settings per key.
+    let bob = user(&mut server, "bob");
+    let carol = user(&mut server, "carol");
+    let mut vault = a1.store.vault().unwrap().unwrap();
+    let mut local = vault.current().clone();
+    local.settings.insert("theme".into(), "dark".into());
+    vault.local = Some(local);
+    a1.store.put_vault(&vault).unwrap();
+    let info = |u: &UnlockedAccount, name: &str| UserInfo {
+        user_id: u.user_id,
+        username: name.into(),
+        public_key: *u.keypair.public_key(),
+    };
+    prepare_share(&mut a1.store, &a1.account, id, &info(&bob, "bob"), Permission::Read, 1).unwrap();
+    let other = a2.create("other");
+    a2.sync(&mut server);
+    prepare_share(&mut a2.store, &a2.account, other, &info(&carol, "carol"), Permission::Read, 1).unwrap();
+    verify_contact(&mut a2.store, carol.user_id).unwrap();
+
+    a1.sync(&mut server);
+    a2.sync(&mut server);
+    a1.sync(&mut server);
+    let (v1, v2) = (a1.store.vault().unwrap().unwrap(), a2.store.vault().unwrap().unwrap());
+    assert!(v1.local.is_none() && v2.local.is_none());
+    assert_eq!(v1.base, v2.base);
+    assert_eq!(v1.base.settings["theme"], "dark");
+    assert_eq!(v1.base.contacts.keys().copied().collect::<BTreeSet<_>>(), BTreeSet::from([bob.user_id, carol.user_id]));
+    assert!(v1.base.contacts[&carol.user_id].verified);
+}
+
+#[test]
+fn rollback_is_ignored() {
+    let mut server = Server::new();
+    let alice = user(&mut server, "alice");
+    let (mut a1, mut a2) = (Device::new(&alice), Device::new(&alice));
+    let id = a1.create("v1");
+    a1.sync(&mut server);
+    let old = server.memos[&id].clone();
+    a1.edit(id, "v2");
+    a1.sync(&mut server);
+    a2.sync(&mut server);
+
+    // Same epoch, old ciphertext: a server replaying version 1.
+    server.memos.insert(id, old);
+    server.fan_out(Entity::Memo(id), [alice.user_id]);
+    assert_eq!(a2.sync(&mut server), vec![SyncEvent::Rollback { memo_id: id, version: 1, highest_seen: 2 }]);
+    assert_eq!(a2.body(id), "v2");
+}
