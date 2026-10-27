@@ -13,6 +13,7 @@ web/            Svelte frontend (browser + Tauri)
 desktop/        Tauri app
 android/        Android app
 docs/           specification
+scripts/        dev tools (crate-ages.py: no crate younger than two weeks)
 ```
 
 ## Build

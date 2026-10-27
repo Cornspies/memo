@@ -59,6 +59,7 @@
     // A sync may have merged another device's edit into the text being edited.
     if (!editing || next.body !== saved) adopt(next.body);
     memo = next;
+    missing = false;
     if (next.conflict || !next.writable) editing = false;
   }
 

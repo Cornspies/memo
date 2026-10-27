@@ -25,10 +25,26 @@ bun run build    # WASM (build-wasm.sh) + Vite → dist/, which `cargo build -p 
 bun run check    # svelte-check (types and Svelte diagnostics)
 bun run wasm     # only rebuild src/wasm/ after changing Rust code
 bun run dev      # Vite on http://localhost:5173, proxying /api to 127.0.0.1:8080
+bun run e2e      # end-to-end test in headless Firefox (see below)
 ```
 
 For `bun run dev`, run a local `memo-server` with `public_url = "http://localhost:5173"`. The
 server only accepts cookie-authenticated writes whose `Origin` matches `public_url`.
+
+## End-to-end test
+
+`e2e/run.ts` drives the app in headless Firefox over WebDriver BiDi (`e2e/bidi.ts`, no extra
+dependencies). It starts `../target/release/memo-server` on a temporary data directory and walks through
+registration, editing, images, unlock after reload, sharing, a conflict, recovery, history, revoking,
+archive, export, password change and the phone layout. It needs `firefox` on the PATH and a server built
+after `bun run build`:
+
+```sh
+bun run build && cargo build --release -p memo-server && bun run e2e
+```
+
+`MEMO_SERVER` overrides the server binary, `E2E_SHOTS=<dir>` saves screenshots, and `E2E_KEEP=1`
+keeps the temporary directory. A failure prints the step, the browser console and the server log.
 
 ## Layout
 
@@ -39,6 +55,7 @@ src/lib/worker.ts       the worker: WASM client, HTTP, sync scheduling, account 
 src/lib/images.ts       image preparation (type check, metadata, rotation, thumbnails)
 src/lib/state.svelte.ts session, sync status, notifications, routing
 src/components/         the UI
+e2e/                    the end-to-end test
 ```
 
 The desktop app will reuse the UI with its own `Backend` (Tauri commands, SQLite store).
