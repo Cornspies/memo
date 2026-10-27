@@ -60,7 +60,7 @@ fn merge_attachments(base: &[AttachmentRef], ours: &[AttachmentRef], theirs: &[A
 
 /// Both sides pinned a different public key for the same user: one of them came from a lying
 /// server. The merged vault keeps the older pin; the UI must raise the key-change alarm.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct PinConflict {
     pub user_id: Uuid,
     pub kept: Contact,

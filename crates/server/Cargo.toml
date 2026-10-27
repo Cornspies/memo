@@ -6,3 +6,21 @@ license.workspace = true
 
 [dependencies]
 memo-core = { path = "../core" }
+argon2 = { version = "0.6", default-features = false, features = ["alloc", "password-hash"] }
+axum = { version = "0.8", default-features = false, features = ["http1", "json", "query", "tokio"] }
+getrandom = "0.4"
+hmac = "0.13"
+http-body-util = "0.1"
+rusqlite = { version = "0.40", default-features = false, features = ["bundled", "cache", "fallible_uint"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tokio = { version = "1.53", features = ["rt-multi-thread", "macros", "net", "fs", "signal", "time", "sync", "io-util"] }
+tokio-util = { version = "0.7", features = ["io"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", default-features = false, features = ["fmt", "std"] }
+uuid = { version = "1", features = ["v7", "serde"] }
+
+[dev-dependencies]
+tower = { version = "0.5", default-features = false, features = ["util"] }

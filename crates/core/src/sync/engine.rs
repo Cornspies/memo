@@ -5,6 +5,7 @@
 
 use std::collections::BTreeSet;
 
+use serde::Serialize;
 use uuid::Uuid;
 
 use super::{
@@ -39,7 +40,8 @@ pub enum Step {
     Done,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum SyncEvent {
     /// The server asked for a full resync (backup restored, or offline for longer than the
     /// tombstone retention).
@@ -93,7 +95,8 @@ pub enum SyncEvent {
     VaultUndecryptable,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum CopyReason {
     Deleted,
     AccessRevoked,
@@ -910,7 +913,7 @@ fn release_attachments<S: Store>(store: &mut S, memo: &MemoRecord, old_base: Opt
 
 /// One blob to `PUT /memos/{memo_id}/attachments/{attachment_id}/{kind}`; the body is
 /// [`Store::blob`]. Call [`upload_done`] after a `200` or `201`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 pub struct Upload {
     pub memo_id: Uuid,
     pub attachment_id: Uuid,

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/server"]
+members = ["crates/core", "crates/server", "crates/wasm"]
 
 [workspace.package]
 version = "0.1.0"
@@ -13,3 +13,10 @@ opt-level = 3
 
 [profile.dev.package.blake2]
 opt-level = 3
+
+# The WASM build of the client core for the web app (`web/build-wasm.sh`).
+[profile.wasm]
+inherits = "release"
+lto = true
+codegen-units = 1
+panic = "abort"

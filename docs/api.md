@@ -27,6 +27,7 @@ private interface.
 | 422 | `quota_exceeded` | Storage quota would be exceeded |
 | 422 | `incomplete_keys` | Sharing/revoke request is missing wrapped keys |
 | 429 | `rate_limited` | Includes a `Retry-After` header |
+| 500 | `internal` | A server bug or I/O failure; details are only in the server log |
 
 ## Authentication
 
@@ -34,7 +35,8 @@ private interface.
   returned once at login. The server stores only its SHA-256.
 - **Web:** cookie `memo_session` (`HttpOnly; Secure; SameSite=Strict; Path=/api`). Every request
   authenticated by cookie that is not `GET` must carry an `Origin` header equal to the configured
-  public URL. Otherwise the server answers `403 forbidden` (CSRF protection).
+  public URL. Otherwise the server answers `403 forbidden` (CSRF protection). `Secure` is left out
+  only when `public_url` is plain `http://` (local testing).
 - Every authenticated request updates the device's `last_seen_at`, at most once a minute.
 
 Usernames: 3–32 characters of `a-z 0-9 _ . -`, stored lowercase, unique.
@@ -75,6 +77,10 @@ the minimum).
 { "user_id": "…", "device_id": "…", "token": "…",
   "public_key": "…", "enc_account_key": "…", "enc_private_key": "…" }
 ```
+
+If the request carries a valid session of the same user (bearer token or cookie), that device is
+revoked and replaced by the new one. The web client unlocks this way after a page reload, so reloads
+do not add devices.
 
 ### `POST /auth/logout`
 Revokes the current device. → `204`

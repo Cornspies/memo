@@ -39,6 +39,7 @@ pub enum ErrorCode {
     QuotaExceeded,
     IncompleteKeys,
     RateLimited,
+    Internal,
     /// A code added by a newer server.
     #[serde(other)]
     Unknown,

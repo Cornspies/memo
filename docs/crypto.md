@@ -205,7 +205,12 @@ to update instead.
 }
 ```
 
-- `body` is CommonMark. Tags are `#hashtags` in the body and are parsed by clients.
+- `body` is CommonMark (plus tables, strikethrough and task lists). Clients that render it display a
+  single newline as a line break.
+- Tags are `#hashtags` in the body: `#` followed by letters, digits, `_`, `-` or `/`, with at least
+  one character that is not a digit (`#2024` is not a tag). The `#` starts a line or follows
+  whitespace or `(`. Tags inside code spans and fenced code blocks do not count. They compare
+  lowercased. `memo_core::text` implements this, so every client agrees.
 - Images are referenced as `attachment:<id>` URLs. `thumb` is `null` if no thumbnail exists.
 - `edited_at` is the client's clock when the edit was made. It is for display only.
 
@@ -241,6 +246,12 @@ Clients, before encrypting:
 When rendering, clients check the decrypted bytes against the `mime` in the payload. Anything that
 does not match, or is not on the allowlist, is offered as a download and never rendered inline. SVG
 and HTML are never rendered. The web client renders through `Blob` URLs with the explicit type.
+
+**Rendering bodies** (`memo_core::render`, used by the web and desktop clients): raw HTML in a body
+is shown as text; links are kept only for `http`, `https` and `mailto` and open with
+`rel="noopener noreferrer"`; images load only from `attachment:` URLs, and remote images become
+links, so opening a memo never contacts a third party. The page's CSP blocks inline scripts as a
+second line of defence.
 
 ## Account flows
 

@@ -1,6 +1,6 @@
 # Server
 
-`memo-server` is a single binary: axum + SQLite, with the web frontend embedded (`rust-embed`). It
+`memo-server` is a single binary: axum + SQLite, with the built web app (`web/dist`) embedded by its build script. It
 never decrypts anything. Its jobs are authentication, access control, ordering, storage, quotas and
 rate limits.
 
@@ -10,7 +10,8 @@ Connection settings: `journal_mode=WAL`, `synchronous=FULL`, `foreign_keys=ON`, 
 All writes go through a single writer connection; reads use a small pool. Schema migrations are
 embedded in the binary and run at startup.
 
-UUIDs are stored as 16-byte `BLOB`s, times as Unix milliseconds.
+UUIDs are stored as 16-byte `BLOB`s, times as Unix milliseconds. The schema below is
+`crates/server/migrations/0001_init.sql` (indexes omitted here).
 
 ```sql
 CREATE TABLE meta (
@@ -81,7 +82,8 @@ CREATE TABLE memos (
   deleted     INTEGER NOT NULL DEFAULT 0,
   created_at  INTEGER NOT NULL,
   updated_at  INTEGER NOT NULL,
-  updated_by  BLOB
+  updated_by  BLOB,
+  deleted_at  INTEGER                          -- tombstone age, for purging
 );
 
 CREATE TABLE memo_revisions (                  -- includes the current version
@@ -130,7 +132,8 @@ CREATE TABLE attachments (
   thumb_size   INTEGER,
   thumb_sha256 BLOB,
   created_at   INTEGER NOT NULL,
-  deleted_at   INTEGER
+  deleted_at   INTEGER,
+  purged_at    INTEGER                         -- blob files removed; no longer counts against the quota
 );
 CREATE INDEX attachments_memo ON attachments(memo_id);
 CREATE INDEX attachments_uploader ON attachments(uploader_id);
@@ -139,7 +142,8 @@ CREATE TABLE change_log (
   seq         INTEGER PRIMARY KEY AUTOINCREMENT,
   user_id     BLOB NOT NULL,
   entity_type TEXT NOT NULL CHECK (entity_type IN ('memo', 'access', 'attachment', 'state', 'vault')),
-  entity_id   BLOB NOT NULL,
+  entity_id   BLOB NOT NULL,                   -- the vault's entity_id is the user id
+  changed_at  INTEGER NOT NULL,
   UNIQUE (user_id, entity_type, entity_id)
 );
 CREATE INDEX change_log_user_seq ON change_log(user_id, seq);
@@ -159,8 +163,8 @@ bytes.
 <data_dir>/
   memo.db, memo.db-wal, memo.db-shm
   secret                          32 random bytes, mode 0600, generated on first start
-  blobs/<first 2 hex chars of id>/<attachment-id>.orig
-  blobs/<first 2 hex chars of id>/<attachment-id>.thumb
+  blobs/<last 2 hex chars of id>/<attachment-id>.orig     (UUIDv7 starts with a timestamp, so the
+  blobs/<last 2 hex chars of id>/<attachment-id>.thumb     last characters spread files evenly)
   tmp/
 ```
 
@@ -176,6 +180,8 @@ Run hourly, and on demand with `memo-server gc`:
 - Delete orphan files in `blobs/` that have no database row and are older than 1 day, and anything in
   `tmp/` older than 1 day.
 - Purge tombstones and `change_log` rows older than `tombstone_days`, and advance `purged_through`.
+  Tombstones are rows for deleted memos and attachments, and `access`/`state` rows of users who are
+  no longer members. Memo rows nobody references any more are then deleted.
 - Remove revisions beyond `revisions_per_memo` (oldest first; the current version is always kept).
 - Remove expired recovery tokens and invites.
 
@@ -202,6 +208,14 @@ deleted_blob_days  = 30
 revisions_per_memo = 100        # 0 = keep all
 ```
 
+## Web app
+
+`build.rs` embeds `web/dist` (or `$MEMO_WEB_DIST`) when it exists; otherwise the server is API-only
+and answers other paths with a hint. Files under `assets/` have content hashes in their names and
+are served with `Cache-Control: public, max-age=31536000, immutable`; everything else with
+`no-cache` and an `ETag`. Paths without a file extension serve `index.html` (the app routes with the
+URL fragment). `invite create` also prints a `<public_url>/#/invite/<code>` link when the app is built in.
+
 ## HTTP hardening
 
 Responses for the embedded web app:
@@ -223,15 +237,15 @@ client IP. They never record request bodies, tokens, cookies or `auth_key`s.
 ```
 memo-server serve [--config <path>]
 memo-server invite create [--role user|admin] [--expires 7d]    # prints the code once
-memo-server invite list
-memo-server invite revoke <code-prefix>
+memo-server invite list                    # ids are the first 8 hex chars of the code's hash
+memo-server invite revoke <id>
 memo-server user list
 memo-server user disable <username>        # blocks login and revokes devices; shared memos stay readable for members
 memo-server user enable <username>
 memo-server user set-quota <username> <size|default>
 memo-server user delete <username>         # same effect as DELETE /me
-memo-server backup <dir>
-memo-server restore <dir>
+memo-server backup <dir>                   # safe while the server runs
+memo-server restore <dir>                  # stop the server first
 memo-server gc
 ```
 

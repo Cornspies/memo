@@ -1,0 +1,4 @@
+[install]
+# Exact versions, and nothing published in the last two weeks (transitive packages included).
+exact = true
+minimumReleaseAge = 1209600

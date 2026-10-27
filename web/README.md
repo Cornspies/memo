@@ -1,0 +1,56 @@
+# memo web app
+
+The browser client: Svelte 5 + TypeScript, built with Vite and embedded into `memo-server`. It is
+online-only (`docs/sync.md`): memos live in memory and sync right away. The UI warns before the tab
+closes while changes are unsynced.
+
+All crypto, sync and merging run in `memo-core`, compiled to WASM (`crates/wasm`) and run in a
+worker, so Argon2 and decryption never block the page. Keys exist only in that worker's memory.
+After a reload the session cookie is still valid, but the keys are gone: the password unlocks again,
+and that login replaces the device instead of adding one.
+
+## Toolchain
+
+- Rust with the `wasm32-unknown-unknown` target: `rustup target add wasm32-unknown-unknown`
+- The `wasm-bindgen` CLI at **exactly** the version pinned in `crates/wasm/Cargo.toml`:
+  `cargo install wasm-bindgen-cli --version 0.2.129 --locked`. Bump both together.
+- [Bun](https://bun.sh) as the package manager. `bunfig.toml` installs exact versions only, and
+  nothing published in the last two weeks.
+
+## Commands
+
+```sh
+bun install
+bun run build    # WASM (build-wasm.sh) + Vite → dist/, which `cargo build -p memo-server` embeds
+bun run check    # svelte-check (types and Svelte diagnostics)
+bun run wasm     # only rebuild src/wasm/ after changing Rust code
+bun run dev      # Vite on http://localhost:5173, proxying /api to 127.0.0.1:8080
+```
+
+For `bun run dev`, run a local `memo-server` with `public_url = "http://localhost:5173"`. The
+server only accepts cookie-authenticated writes whose `Origin` matches `public_url`.
+
+## Layout
+
+```
+src/lib/types.ts        Backend interface and the read models (mirrors memo_core::sync::view)
+src/lib/backend.ts      Backend for the browser: forwards calls to the worker
+src/lib/worker.ts       the worker: WASM client, HTTP, sync scheduling, account flows
+src/lib/images.ts       image preparation (type check, metadata, rotation, thumbnails)
+src/lib/state.svelte.ts session, sync status, notifications, routing
+src/components/         the UI
+```
+
+The desktop app will reuse the UI with its own `Backend` (Tauri commands, SQLite store).
+
+## Content Security Policy
+
+The server sends `script-src 'self' 'wasm-unsafe-eval'; style-src 'self'; img-src 'self' blob:`.
+So: no inline scripts or `style="…"` attributes (use classes, or Svelte's `style:` directive, which
+goes through the CSSOM), no Svelte transitions (they inject `<style>` elements), no `data:` URLs.
+Rendered memo HTML comes from `memo_core::render`, which escapes raw HTML.
+
+## Not done yet
+
+- "Keep unlocked in this browser" (`docs/crypto.md#account-flows`): the keys are always in memory only.
+- Downscaling images on upload is supported by `images.ts` but has no setting in the UI yet.

@@ -7,13 +7,17 @@ mod content;
 mod encoding;
 mod envelope;
 mod error;
+pub mod image;
 mod kdf;
 mod keys;
 mod merge;
 mod payload;
 mod recovery;
+#[cfg(feature = "render")]
+pub mod render;
 mod share;
 pub mod sync;
+pub mod text;
 #[cfg(test)]
 mod vectors;
 
