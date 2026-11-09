@@ -3,7 +3,7 @@
 //!
 //! JSON crosses the boundary as strings (the `memo_core::api` wire format, or the read models in
 //! `memo_core::sync`), bytes as `Uint8Array`. Errors are JS `Error`s whose `name` is a stable code
-//! (see [`code`]).
+//! (see [`core`]).
 
 use memo_core::{
     AttachmentKind, KdfParams, MemoPayload, PasswordKeys, RecoveryKey, UnlockedAccount,
@@ -27,29 +27,9 @@ fn error(name: &str, message: impl std::fmt::Display) -> JsValue {
     error.into()
 }
 
-/// The `name` of the thrown error, for the UI to branch on.
-fn code(e: &memo_core::Error) -> &'static str {
-    use memo_core::Error::*;
-    match e {
-        Decrypt => "decrypt",
-        UnsupportedFormat(_) | UnsupportedPayloadVersion(_) => "newer_format",
-        Malformed(_) => "malformed",
-        KdfParamsOutOfBounds => "kdf_params",
-        PasswordTooShort => "password_too_short",
-        RecoveryKeyInvalid | RecoveryKeyChecksum => "recovery_key_invalid",
-        KeyMismatch => "key_mismatch",
-        NotFound => "not_found",
-        NotOwner => "not_owner",
-        ReadOnly => "read_only",
-        InConflict => "in_conflict",
-        KeyChanged(_) => "key_changed",
-        NotPinned(_) => "not_pinned",
-        Store(_) => "store",
-    }
-}
-
+/// A JS `Error` whose `name` is [`memo_core::Error::code`].
 fn core(e: memo_core::Error) -> JsValue {
-    error(code(&e), &e)
+    error(e.code(), &e)
 }
 
 fn parse<T: serde::de::DeserializeOwned>(json: &str) -> JsResult<T> {
@@ -371,11 +351,7 @@ impl Client {
 
     /// Anything local the server does not have yet. Closing the tab would lose it.
     pub fn has_unsynced(&self) -> JsResult<bool> {
-        let s = &self.store;
-        Ok(!s.dirty_memo_ids().map_err(core)?.is_empty()
-            || !s.dirty_state_ids().map_err(core)?.is_empty()
-            || s.vault().map_err(core)?.is_some_and(|v| v.local.is_some())
-            || s.pending_attachments().map_err(core)?.iter().any(|a| a.upload_original || a.upload_thumbnail))
+        sync::has_unsynced(&self.store).map_err(core)
     }
 
     // -- Read models --
@@ -398,21 +374,7 @@ impl Client {
     /// Decrypted attachment bytes, or `undefined` if the blob is not cached yet (download it,
     /// [`put_blob`](Self::put_blob), and ask again). Check them with [`image_renderable`].
     pub fn attachment(&self, memo_id: &str, attachment_id: &str, kind: &str) -> JsResult<Option<Vec<u8>>> {
-        let (memo_id, attachment_id) = (id(memo_id)?, id(attachment_id)?);
-        let memo = self.store.memo(memo_id).map_err(core)?.ok_or_else(|| core(memo_core::Error::NotFound))?;
-        let payloads = [
-            memo.local.as_ref(),
-            memo.base.as_ref(),
-            memo.conflict.as_ref().map(|c| &c.theirs),
-            memo.undecoded.as_ref().and_then(|u| u.view.as_ref()),
-        ];
-        let attachment = payloads
-            .into_iter()
-            .flatten()
-            .flat_map(|p| &p.attachments)
-            .find(|a| a.id == attachment_id)
-            .ok_or_else(|| core(memo_core::Error::NotFound))?;
-        sync::cached_attachment(&self.store, attachment, self::kind(kind)?).map_err(core)
+        sync::memo_attachment(&self.store, id(memo_id)?, id(attachment_id)?, self::kind(kind)?).map_err(core)
     }
 
     // -- Local edits --
@@ -426,31 +388,12 @@ impl Client {
     /// Replaces the body. `prune` also drops attachments the body no longer refers to; pass it when
     /// the editor closes.
     pub fn edit_memo(&mut self, memo_id: &str, body: &str, now: f64, prune: bool) -> JsResult<()> {
-        let memo_id = id(memo_id)?;
-        let memo = self.store.memo(memo_id).map_err(core)?.ok_or_else(|| core(memo_core::Error::NotFound))?;
-        let current = memo.current().ok_or_else(|| core(memo_core::Error::ReadOnly))?;
-        let mut payload = current.clone();
-        if payload.body != body {
-            payload.body = body.into();
-            payload.edited_at = now as i64;
-        }
-        if prune {
-            payload.prune_attachments();
-        }
-        if &payload == current {
-            return Ok(());
-        }
-        sync::edit_memo(&mut self.store, memo_id, payload).map_err(core)
+        sync::edit_body(&mut self.store, id(memo_id)?, body, now as i64, prune).map_err(core)
     }
 
     /// Flips the task box at `offset` (from the rendered `data-task`). False if the body changed.
     pub fn toggle_task(&mut self, memo_id: &str, offset: usize, now: f64) -> JsResult<bool> {
-        let memo = self.store.memo(id(memo_id)?).map_err(core)?.ok_or_else(|| core(memo_core::Error::NotFound))?;
-        let body = memo.current().map(|p| p.body.clone()).unwrap_or_default();
-        match render::toggle_task(&body, offset) {
-            Some(body) => self.edit_memo(memo_id, &body, now, false).map(|()| true),
-            None => Ok(false),
-        }
+        sync::toggle_task(&mut self.store, id(memo_id)?, offset, now as i64).map_err(core)
     }
 
     pub fn delete_memo(&mut self, memo_id: &str) -> JsResult<()> {
@@ -463,20 +406,7 @@ impl Client {
 
     /// Settles a conflict with `body`, keeping the images either side has that it refers to.
     pub fn resolve_conflict(&mut self, memo_id: &str, body: &str, now: f64) -> JsResult<()> {
-        let memo_id = id(memo_id)?;
-        let memo = self.store.memo(memo_id).map_err(core)?.ok_or_else(|| core(memo_core::Error::NotFound))?;
-        let theirs = memo.conflict.as_ref().map(|c| c.theirs.clone()).ok_or_else(|| error("no_conflict", memo_id))?;
-        let mut resolved = MemoPayload::new(body, now as i64);
-        for attachment in memo.current().into_iter().flat_map(|p| &p.attachments).chain(&theirs.attachments) {
-            if !resolved.attachments.iter().any(|a| a.id == attachment.id) {
-                resolved.attachments.push(attachment.clone());
-            }
-        }
-        resolved.prune_attachments();
-        if resolved.body == theirs.body && resolved.attachments == theirs.attachments {
-            resolved = theirs;
-        }
-        sync::resolve_conflict(&mut self.store, memo_id, resolved).map_err(core)
+        sync::resolve_with_body(&mut self.store, id(memo_id)?, body, now as i64).map_err(core)
     }
 
     /// Returns the copy's id.
@@ -526,10 +456,7 @@ impl Client {
     /// Makes an old revision the working copy; the next sync pushes it as a new version.
     pub fn restore_revision(&mut self, memo_id: &str, revision: &str, now: f64) -> JsResult<()> {
         let revision: Revision = parse(revision)?;
-        let memo_id = id(memo_id)?;
-        let mut payload = sync::open_revision(&self.store, memo_id, &revision).map_err(core)?;
-        payload.edited_at = now as i64;
-        sync::edit_memo(&mut self.store, memo_id, payload).map_err(core)
+        sync::restore_revision(&mut self.store, id(memo_id)?, &revision, now as i64).map_err(core)
     }
 
     // -- Sharing --

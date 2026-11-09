@@ -19,8 +19,8 @@ with its own HTTP stack, and the engine applies the response. Storage sits behin
 
 | Client | Store backend |
 |---|---|
-| Tauri desktop | SQLite on disk (offline-capable) |
-| Android | SQLDelight store, reached through UniFFI callbacks (offline-capable) |
+| Tauri desktop | SQLite on disk, `crates/sqlite` (offline-capable) |
+| Android | The same SQLite store, inside the native library (offline-capable) |
 | Web | In-memory (online-only). Unsent edits are lost if the tab closes; the UI warns before leaving |
 
 ## Server: change log

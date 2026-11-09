@@ -1,11 +1,12 @@
-//! Markdown to HTML for clients that display memos in a web view. The output is safe to insert
-//! into the page: raw HTML in the source is shown as text, links are limited to `http`, `https` and
-//! `mailto`, and images only load from attachments (remote images become links, so opening a memo
-//! never contacts a third party).
+//! Markdown to HTML for clients that display memos in a web view ([`to_blocks`] for native UIs,
+//! with the same rules). The output is safe to insert into the page: raw HTML in the source is shown
+//! as text, links are limited to `http`, `https` and `mailto`, and images only load from
+//! attachments (remote images become links, so opening a memo never contacts a third party).
 //!
 //! The markup the client fills in or reacts to:
 //! - `<img class="attachment" data-attachment="<id>" alt="…">`: no `src`; the client sets a `blob:` URL.
-//! - `<input type="checkbox" data-task="<offset>">`: a task box; [`toggle_task`] flips it in the source.
+//! - `<input type="checkbox" data-task="<offset>">`: a task box; [`text::toggle_task`](crate::text::toggle_task)
+//!   flips it in the source.
 //! - `<span class="tag" data-tag="<lowercased>">#Tag</span>`.
 
 use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, html};
@@ -13,16 +14,19 @@ use uuid::Uuid;
 
 use crate::text::{ATTACHMENT_SCHEME, find_tags};
 
+pub mod blocks;
+pub use blocks::to_blocks;
+
 const SAFE_SCHEMES: [&str; 3] = ["http", "https", "mailto"];
+const OPTIONS: Options = Options::ENABLE_TABLES.union(Options::ENABLE_STRIKETHROUGH).union(Options::ENABLE_TASKLISTS);
 
 pub fn to_html(body: &str) -> String {
-    let options = Options::ENABLE_TABLES | Options::ENABLE_STRIKETHROUGH | Options::ENABLE_TASKLISTS;
     let mut events: Vec<Event> = Vec::new();
     // Open links: whether each one was emitted (unsafe ones are dropped, keeping their text).
     let mut links: Vec<bool> = Vec::new();
     let mut image: Option<(CowStr, String)> = None;
     let (mut in_code, mut boundary) = (false, true);
-    for (event, range) in Parser::new_ext(body, options).into_offset_iter() {
+    for (event, range) in Parser::new_ext(body, OPTIONS).into_offset_iter() {
         if let Some((_, alt)) = &mut image {
             match event {
                 Event::Text(t) | Event::Code(t) => alt.push_str(&t),
@@ -152,21 +156,10 @@ fn escape(text: &str) -> String {
     out
 }
 
-/// Flips the task box whose `data-task` offset is `offset`. `None` if there is no box there (the
-/// body changed since it was rendered).
-pub fn toggle_task(body: &str, offset: usize) -> Option<String> {
-    let marker = body.get(offset..offset + 3)?;
-    let replacement = match marker {
-        "[ ]" => "[x]",
-        "[x]" | "[X]" => "[ ]",
-        _ => return None,
-    };
-    Some(format!("{}{replacement}{}", &body[..offset], &body[offset + 3..]))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::text::toggle_task;
 
     #[test]
     fn raw_html_is_shown_as_text() {

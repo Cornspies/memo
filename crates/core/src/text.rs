@@ -230,6 +230,18 @@ pub fn referenced_attachments(body: &str) -> BTreeSet<Uuid> {
         .collect()
 }
 
+/// Flips the task box (`[ ]` or `[x]`) at byte `offset`, as `memo_core::render` reports it. `None`
+/// if there is no box there (the body changed since it was rendered).
+pub fn toggle_task(body: &str, offset: usize) -> Option<String> {
+    let marker = body.get(offset..offset + 3)?;
+    let replacement = match marker {
+        "[ ]" => "[x]",
+        "[x]" | "[X]" => "[ ]",
+        _ => return None,
+    };
+    Some(format!("{}{replacement}{}", &body[..offset], &body[offset + 3..]))
+}
+
 impl MemoPayload {
     /// Drops attachments the body no longer refers to. Clients call this when the editor closes,
     /// not on every keystroke, so cutting and pasting an image line does not delete the image.

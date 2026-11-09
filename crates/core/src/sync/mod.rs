@@ -15,8 +15,9 @@ pub use engine::{
     CopyReason, MAX_ROUNDS, Step, SyncEvent, SyncReport, SyncSession, Upload, pending_uploads, upload_done,
 };
 pub use local::{
-    NewAttachment, NewThumbnail, add_attachment, cached_attachment, create_memo, delete_memo, edit_memo,
-    resolve_conflict, save_as_copy, set_memo_state, verify_contact,
+    NewAttachment, NewThumbnail, add_attachment, cached_attachment, create_memo, delete_memo, edit_body, edit_memo,
+    has_unsynced, memo_attachment, resolve_conflict, resolve_with_body, restore_revision, save_as_copy, set_memo_state,
+    toggle_task, verify_contact,
 };
 pub use memory::MemoryStore;
 pub use sharing::{PreparedRevoke, apply_revoke, prepare_revoke, prepare_share};

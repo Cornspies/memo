@@ -40,3 +40,26 @@ pub enum Error {
     #[error("local store: {0}")]
     Store(String),
 }
+
+impl Error {
+    /// A stable name for clients to branch on (the bridges hand it to the UI).
+    pub fn code(&self) -> &'static str {
+        use Error::*;
+        match self {
+            Decrypt => "decrypt",
+            UnsupportedFormat(_) | UnsupportedPayloadVersion(_) => "newer_format",
+            Malformed(_) => "malformed",
+            KdfParamsOutOfBounds => "kdf_params",
+            PasswordTooShort => "password_too_short",
+            RecoveryKeyInvalid | RecoveryKeyChecksum => "recovery_key_invalid",
+            KeyMismatch => "key_mismatch",
+            NotFound => "not_found",
+            NotOwner => "not_owner",
+            ReadOnly => "read_only",
+            InConflict => "in_conflict",
+            KeyChanged(_) => "key_changed",
+            NotPinned(_) => "not_pinned",
+            Store(_) => "store",
+        }
+    }
+}

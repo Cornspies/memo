@@ -247,11 +247,11 @@ When rendering, clients check the decrypted bytes against the `mime` in the payl
 does not match, or is not on the allowlist, is offered as a download and never rendered inline. SVG
 and HTML are never rendered. The web client renders through `Blob` URLs with the explicit type.
 
-**Rendering bodies** (`memo_core::render`, used by the web and desktop clients): raw HTML in a body
-is shown as text; links are kept only for `http`, `https` and `mailto` and open with
-`rel="noopener noreferrer"`; images load only from `attachment:` URLs, and remote images become
-links, so opening a memo never contacts a third party. The page's CSP blocks inline scripts as a
-second line of defence.
+**Rendering bodies** (`memo_core::render`: HTML for the web and desktop clients, a block tree for
+Android's native UI): raw HTML in a body is shown as text; links are kept only for `http`, `https`
+and `mailto` and open with `rel="noopener noreferrer"`; images load only from `attachment:` URLs,
+and remote images become links, so opening a memo never contacts a third party. The page's CSP
+blocks inline scripts as a second line of defence; Android never uses a web view for memos.
 
 ## Account flows
 
@@ -294,5 +294,5 @@ KDF parameters, `auth_key` and `enc_account_key`. It can optionally revoke all o
 ## Test vectors
 
 `crates/core` generates JSON test vectors (`docs/test-vectors/`) for every derivation, envelope,
-HPKE wrap, payload encoding and recovery-key encoding. The WASM and UniFFI builds run the same vectors
+HPKE wrap, payload encoding and recovery-key encoding. The WASM and Android builds run the same vectors
 in CI, so all platforms are guaranteed to produce byte-identical results.

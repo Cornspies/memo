@@ -21,8 +21,9 @@ crates/core     Rust: types, crypto, merge, sync engine. Used by every component
 crates/server   Rust (axum + SQLite): API, auth, encrypted blob storage. Never decrypts.
 crates/wasm     core compiled to WASM for the browser (in-memory store).
 web/            Svelte + TypeScript. Browser (online-only) and Tauri frontend. Uses core via WASM.
-desktop/        Tauri. Its Rust side runs core natively with a local SQLite store (offline).
-android/        Compose Multiplatform. Uses core via UniFFI; SQLDelight store; WorkManager sync.
+desktop/        Tauri. Its Rust side runs core natively with the SQLite store (crates/sqlite, offline).
+android/        Compose Multiplatform. Uses core natively over JNI (crates/android) with the SQLite store
+                (crates/sqlite); WorkManager sync.
 ```
 
 All cryptography, the payload formats and the three-way merge live in `crates/core`, and only there.

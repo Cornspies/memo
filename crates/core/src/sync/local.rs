@@ -6,15 +6,17 @@ use uuid::Uuid;
 use super::{
     ops::{self, transaction},
     store::{AttachmentRecord, MemoRecord, PushError, StateRecord, Store, UndecodedReason},
+    view::open_revision,
 };
 use crate::{
     Error, Result,
     account::UnlockedAccount,
-    api::Permission,
+    api::{Permission, Revision},
     content::seal_attachment,
     envelope::AttachmentKind,
     keys::{AttachmentKey, MemoKey},
     payload::{AttachmentRef, MemoPayload, ThumbRef},
+    text,
 };
 
 /// Creates a memo owned by the account. `now` (Unix ms) becomes `created_at`.
@@ -39,6 +41,44 @@ pub fn edit_memo<S: Store>(store: &mut S, id: Uuid, payload: MemoPayload) -> Res
         }
         store.put_memo(&memo)
     })
+}
+
+/// Replaces the body of the working copy, as an editor does. `prune` also drops attachments the
+/// body no longer refers to; pass it when the editor closes. Does nothing if nothing changed.
+pub fn edit_body<S: Store>(store: &mut S, id: Uuid, body: &str, now: i64, prune: bool) -> Result<()> {
+    let memo = existing(store, id)?;
+    let current = memo.current().ok_or(Error::ReadOnly)?;
+    let mut payload = current.clone();
+    if payload.body != body {
+        payload.body = body.into();
+        payload.edited_at = now;
+    }
+    if prune {
+        payload.prune_attachments();
+    }
+    if &payload == current {
+        return Ok(());
+    }
+    edit_memo(store, id, payload)
+}
+
+/// Flips the task box at byte `offset` of the body (see [`text::toggle_task`]). False if there is
+/// no box there any more.
+pub fn toggle_task<S: Store>(store: &mut S, id: Uuid, offset: usize, now: i64) -> Result<bool> {
+    let memo = existing(store, id)?;
+    let body = memo.current().map(|p| p.body.as_str()).unwrap_or_default();
+    match text::toggle_task(body, offset) {
+        Some(body) => edit_body(store, id, &body, now, false).map(|()| true),
+        None => Ok(false),
+    }
+}
+
+/// Makes an old revision (`GET /memos/{id}/revisions/{version}`) the working copy; the next sync
+/// pushes it as a new version.
+pub fn restore_revision<S: Store>(store: &mut S, id: Uuid, revision: &Revision, now: i64) -> Result<()> {
+    let mut payload = open_revision(store, id, revision)?;
+    payload.edited_at = now;
+    edit_memo(store, id, payload)
 }
 
 /// Owner only; members leave with `DELETE /memos/{id}/members/me` instead. A memo that never
@@ -75,6 +115,24 @@ pub fn resolve_conflict<S: Store>(store: &mut S, id: Uuid, resolved: MemoPayload
         memo.key_version = conflict.theirs_key_version;
         store.put_memo(&memo)
     })
+}
+
+/// Settles a conflict with the body the user wrote, keeping the images either side has that it
+/// refers to.
+pub fn resolve_with_body<S: Store>(store: &mut S, id: Uuid, body: &str, now: i64) -> Result<()> {
+    let memo = existing(store, id)?;
+    let theirs = memo.conflict.as_ref().map(|c| c.theirs.clone()).ok_or(Error::Malformed("no conflict to resolve"))?;
+    let mut resolved = MemoPayload::new(body, now);
+    for attachment in memo.current().into_iter().flat_map(|p| &p.attachments).chain(&theirs.attachments) {
+        if !resolved.attachments.iter().any(|a| a.id == attachment.id) {
+            resolved.attachments.push(attachment.clone());
+        }
+    }
+    resolved.prune_attachments();
+    if resolved.body == theirs.body && resolved.attachments == theirs.attachments {
+        resolved = theirs;
+    }
+    resolve_conflict(store, id, resolved)
 }
 
 /// Saves the memo's current content as a new private memo, e.g. after losing write permission.
@@ -167,6 +225,38 @@ pub fn cached_attachment<S: Store>(
     kind: AttachmentKind,
 ) -> Result<Option<Vec<u8>>> {
     ops::cached_plaintext(store, attachment, kind)
+}
+
+/// [`cached_attachment`] for an attachment of a memo, found in any version the UI can show: the
+/// working copy, the synced one, the other side of a conflict, or a read-only newer one.
+pub fn memo_attachment<S: Store>(
+    store: &S,
+    memo_id: Uuid,
+    attachment_id: Uuid,
+    kind: AttachmentKind,
+) -> Result<Option<Vec<u8>>> {
+    let memo = store.memo(memo_id)?.ok_or(Error::NotFound)?;
+    let payloads = [
+        memo.local.as_ref(),
+        memo.base.as_ref(),
+        memo.conflict.as_ref().map(|c| &c.theirs),
+        memo.undecoded.as_ref().and_then(|u| u.view.as_ref()),
+    ];
+    let attachment = payloads
+        .into_iter()
+        .flatten()
+        .flat_map(|p| &p.attachments)
+        .find(|a| a.id == attachment_id)
+        .ok_or(Error::NotFound)?;
+    cached_attachment(store, attachment, kind)
+}
+
+/// Anything local the server does not have yet: edits, states, the vault or image uploads.
+pub fn has_unsynced<S: Store>(store: &S) -> Result<bool> {
+    Ok(!store.dirty_memo_ids()?.is_empty()
+        || !store.dirty_state_ids()?.is_empty()
+        || store.vault()?.is_some_and(|v| v.local.is_some())
+        || store.pending_attachments()?.iter().any(|a| a.upload_original || a.upload_thumbnail))
 }
 
 /// Marks a contact as verified after the user compared fingerprints out of band.

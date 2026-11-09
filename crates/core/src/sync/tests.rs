@@ -886,3 +886,52 @@ fn rollback_is_ignored() {
     assert_eq!(a2.sync(&mut server), vec![SyncEvent::Rollback { memo_id: id, version: 1, highest_seen: 2 }]);
     assert_eq!(a2.body(id), "v2");
 }
+
+#[test]
+fn editor_helpers() {
+    let mut server = Server::new();
+    let alice = user(&mut server, "alice");
+    let (mut a1, mut a2) = (Device::new(&alice), Device::new(&alice));
+    let id = a1.create("- [ ] milk\n- [ ] eggs");
+    assert!(has_unsynced(&a1.store).unwrap());
+    a1.sync(&mut server);
+    assert!(!has_unsynced(&a1.store).unwrap());
+
+    edit_body(&mut a1.store, id, "- [ ] milk\n- [ ] eggs", 5, true).unwrap();
+    assert!(clean(&a1, id), "an unchanged body is not an edit");
+    assert!(toggle_task(&mut a1.store, id, 2, 5).unwrap());
+    assert_eq!(a1.body(id), "- [x] milk\n- [ ] eggs");
+    assert_eq!(a1.memo(id).local.unwrap().edited_at, 5);
+    assert!(!toggle_task(&mut a1.store, id, 0, 5).unwrap());
+    assert!(has_unsynced(&a1.store).unwrap());
+
+    let new = NewAttachment { mime: "image/png".into(), width: 1, height: 1, bytes: b"png", thumbnail: None };
+    let attachment = add_attachment(&mut a1.store, id, new).unwrap();
+    let with_image = format!("{}\n![](attachment:{})", a1.body(id), attachment.id);
+    edit_body(&mut a1.store, id, &with_image, 6, true).unwrap();
+    assert_eq!(memo_attachment(&a1.store, id, attachment.id, AttachmentKind::Original).unwrap().unwrap(), b"png");
+    a1.sync(&mut server);
+    a2.sync(&mut server);
+
+    // Both sides edit the first line; a2 resolves with a body that keeps the image.
+    edit_body(&mut a1.store, id, &with_image.replace("milk", "oat milk"), 7, false).unwrap();
+    edit_body(&mut a2.store, id, &with_image.replace("milk", "soy milk"), 7, false).unwrap();
+    a1.sync(&mut server);
+    assert_eq!(a2.sync(&mut server), vec![SyncEvent::Conflict { memo_id: id }]);
+    let resolved = with_image.replace("milk", "oat and soy milk");
+    resolve_with_body(&mut a2.store, id, &resolved, 8).unwrap();
+    assert_eq!(a2.memo(id).current().unwrap().attachments, vec![attachment.clone()]);
+    a2.sync(&mut server);
+    a1.sync(&mut server);
+    assert_eq!(a1.body(id), resolved);
+
+    // Taking their side exactly leaves nothing to push.
+    edit_body(&mut a1.store, id, "mine", 9, true).unwrap();
+    edit_body(&mut a2.store, id, "theirs", 9, true).unwrap();
+    assert!(a2.memo(id).current().unwrap().attachments.is_empty(), "prune drops the image");
+    a2.sync(&mut server);
+    a1.sync(&mut server);
+    resolve_with_body(&mut a1.store, id, "theirs", 10).unwrap();
+    assert!(clean(&a1, id));
+    assert_eq!(memo_attachment(&a1.store, id, attachment.id, AttachmentKind::Original), Err(crate::Error::NotFound));
+}

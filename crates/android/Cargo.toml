@@ -1,0 +1,19 @@
+[package]
+name = "memo-android"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lib]
+name = "memo"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+memo-core = { path = "../core", features = ["render"] }
+memo-sqlite = { path = "../sqlite" }
+# Only the JNI type and function-table declarations; no dependencies of its own.
+jni-sys = "=0.3.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = "1"

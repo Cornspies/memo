@@ -180,7 +180,7 @@ impl VaultRecord {
     }
 }
 
-/// Local persistence. Implementations: SQLite (desktop), SQLDelight via UniFFI (Android),
+/// Local persistence. Implementations: SQLite (`memo-sqlite`, desktop and Android),
 /// [`MemoryStore`](super::MemoryStore) (web, tests).
 ///
 /// Reads inside a transaction must see that transaction's writes. The engine never nests

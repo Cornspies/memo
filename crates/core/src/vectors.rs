@@ -5,7 +5,7 @@
 //! `MEMO_WRITE_VECTORS=1 cargo test -p memo-core vectors`.
 //!
 //! `vectors_verify` checks the file through the public API only, the same way the WASM and
-//! UniFFI bindings do on their platforms.
+//! Android bridges do on their platforms.
 
 use rand_chacha::ChaCha20Rng;
 use rand_core::SeedableRng;

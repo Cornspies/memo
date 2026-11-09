@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/core", "crates/server", "crates/wasm"]
+members = ["crates/android", "crates/core", "crates/server", "crates/sqlite", "crates/wasm"]
 
 [workspace.package]
 version = "0.1.0"
@@ -20,3 +20,11 @@ inherits = "release"
 lto = true
 codegen-units = 1
 panic = "abort"
+
+# The Android library (`android/build-rust.sh`). Unwinding stays on: the bridge turns panics into
+# errors instead of crashing the app.
+[profile.android]
+inherits = "release"
+lto = true
+codegen-units = 1
+strip = true
