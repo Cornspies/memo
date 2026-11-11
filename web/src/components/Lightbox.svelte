@@ -1,6 +1,7 @@
 <script lang="ts">
   import { loadAttachment, type Loaded } from "../lib/attachments";
   import { size } from "../lib/format";
+  import { backend, errorText, toast } from "../lib/state.svelte";
   import type { AttachmentView } from "../lib/types";
 
   let { memoId, attachment, onclose }: { memoId: string; attachment: AttachmentView; onclose: () => void } =
@@ -8,6 +9,19 @@
   let loaded = $state<Loaded | undefined>(undefined);
   let failed = $state(false);
   let dialog: HTMLDialogElement;
+
+  /** The desktop window cannot download links. */
+  async function save(event: MouseEvent) {
+    if (!backend.native) return;
+    event.preventDefault();
+    try {
+      const result = await backend.attachment(memoId, attachment.id, "original");
+      const path = result && (await backend.saveFile(result.bytes, "attachment.bin", "application/octet-stream"));
+      if (path) toast("info", `Saved to ${path}`);
+    } catch (e) {
+      toast("danger", errorText(e));
+    }
+  }
 
   $effect(() => {
     dialog.showModal();
@@ -31,7 +45,7 @@
   {:else}
     <p class="message">
       The decrypted file is not a valid {attachment.mime} image, so it is not shown.
-      <a href={loaded.url} download="attachment.bin">Download it ({size(attachment.size)})</a>
+      <a href={loaded.url} download="attachment.bin" onclick={save}>Download it ({size(attachment.size)})</a>
     </p>
   {/if}
 </dialog>

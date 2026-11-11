@@ -1,6 +1,7 @@
 # memo web app
 
-The browser client: Svelte 5 + TypeScript, built with Vite and embedded into `memo-server`. It is
+The browser client: Svelte 5 + TypeScript, built with Vite and embedded into `memo-server`. The
+desktop app (`desktop/`) shows the same UI with another backend (`src/lib/native.ts`). In the browser it is
 online-only (`docs/sync.md`): memos live in memory and sync right away. The UI warns before the tab
 closes while changes are unsynced.
 
@@ -26,6 +27,7 @@ bun run check    # svelte-check (types and Svelte diagnostics)
 bun run wasm     # only rebuild src/wasm/ after changing Rust code
 bun run dev      # Vite on http://localhost:5173, proxying /api to 127.0.0.1:8080
 bun run e2e      # end-to-end test in headless Firefox (see below)
+bun run e2e:desktop  # the desktop app's, against `memo-desktop --serve` (desktop/README.md)
 ```
 
 For `bun run dev`, run a local `memo-server` with `public_url = "http://localhost:5173"`. The
@@ -52,13 +54,13 @@ keeps the temporary directory. A failure prints the step, the browser console an
 src/lib/types.ts        Backend interface and the read models (mirrors memo_core::sync::view)
 src/lib/backend.ts      Backend for the browser: forwards calls to the worker
 src/lib/worker.ts       the worker: WASM client, HTTP, sync scheduling, account flows
+src/lib/native.ts       Backend for the desktop app: Tauri IPC to memo-core, sync scheduling, account
 src/lib/images.ts       image preparation (type check, metadata, rotation, thumbnails)
+src/lib/exported.ts     file names and memo links in the export
 src/lib/state.svelte.ts session, sync status, notifications, routing
 src/components/         the UI
 e2e/                    the end-to-end test
 ```
-
-The desktop app will reuse the UI with its own `Backend` (Tauri commands, SQLite store).
 
 ## Content Security Policy
 

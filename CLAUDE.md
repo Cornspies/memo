@@ -7,17 +7,18 @@ then the code, and keep them in sync.
 ## Status and what comes next
 
 Done: `crates/core` (types, crypto, merge, sync engine), `crates/server` (axum + SQLite), `crates/wasm`
-and the web client (`web/`, online-only, see `web/README.md`), and the Android app (`android/`,
-offline-first, see `android/README.md`): Compose Multiplatform UI, `memo-core` over a hand-written
-JNI bridge (`crates/android`) with the rusqlite `Store` (`crates/sqlite`). The user chose JNI over
-UniFFI and rusqlite over SQLDelight to keep dependencies down.
+and the web client (`web/`, online-only, see `web/README.md`), the Android app (`android/`,
+offline-first, see `android/README.md`) and the Linux desktop app (`desktop/`, offline-first, see
+`desktop/README.md`).
 
-Next: the **Linux desktop app** (`desktop/`, Tauri, offline-first). Its Rust side runs `memo-core`
-with `crates/sqlite`, much like `crates/android` does. The frontend is the existing web UI with a
-second implementation of the `Backend` interface (`web/src/lib/types.ts`) that calls Tauri commands
-instead of the worker.
+- Both native apps share `crates/native`: one JSON call into `memo-core` with the rusqlite `Store`
+  (`crates/sqlite`). Android reaches it over a hand-written JNI bridge (`crates/android`), the desktop
+  over one Tauri command (`desktop/src/calls.rs`). The user chose JNI over UniFFI and rusqlite over
+  SQLDelight to keep dependencies down.
+- Android's UI is Compose Multiplatform. The desktop shows the web UI with a second `Backend`
+  (`web/src/lib/native.ts`); `web/src/lib/state.svelte.ts` picks it inside Tauri.
 
-Known gaps are listed at the end of `web/README.md` and `android/README.md`.
+Known gaps are listed at the end of `web/README.md`, `android/README.md` and `desktop/README.md`.
 
 ## Dependencies
 
@@ -25,15 +26,14 @@ The user started this project to escape upstream churn. Dependencies are a liabi
 
 - Prefer the standard library and mature, stable-API libraries with few transitive dependencies.
   Say so explicitly before adding anything pre-1.0 or fast-moving, and ask before adding a new one.
-- Pin exact versions and update on purpose, never in passing.
-- **Nothing published less than two weeks ago**, transitive dependencies included:
-  - Rust: after every `Cargo.lock` change run `scripts/crate-ages.py`, and pin anything too new back
-    with `cargo update -p <crate> --precise <version>`.
+- Rust: plain semver requirements in `Cargo.toml` (no `=`), kept on the latest compatible versions
+  with `cargo update`. `Cargo.lock` is checked in. No age check: the user dropped it for crates.
+- Web and Android: nothing published less than two weeks ago, transitive dependencies included:
   - Web: `web/bunfig.toml` enforces it (`exact = true`, `minimumReleaseAge`). Install with Bun only.
   - Android/Gradle: every resolved artifact is pinned in the `gradle.lockfile`s. After changing a
     version, rewrite the locks (`android/README.md`) and run `scripts/maven-ages.py`.
-- `wasm-bindgen` in `crates/wasm/Cargo.toml` is pinned with `=` and must match the installed
-  `wasm-bindgen-cli`. Bump both together.
+- The one Rust exception: `wasm-bindgen` in `crates/wasm/Cargo.toml` is pinned with `=` and must
+  match the installed `wasm-bindgen-cli`. Bump both together.
 
 ## Checks
 
@@ -47,11 +47,13 @@ cargo fmt --check
 (cd web && bun run check)                                    # svelte-check
 (cd web && bun run build) && cargo build --release -p memo-server
 (cd web && bun run e2e)                                      # headless Firefox, needs the build above
-(cd android && ./gradlew assembleDebug)                      # also builds libmemo.so
+cargo build -p memo-desktop && (cd web && bun run e2e:desktop)  # the desktop app, the same way
+(cd android && ./gradlew assembleDebug)                      # also builds libmemo.so (ANDROID_HOME)
 ```
 
 The Android app has no automated UI test yet: try changes on the emulator against a local server
-(`android/README.md`).
+(`android/README.md`). The desktop test leaves out the Tauri window and the keyring: try those by
+hand (`desktop/README.md`).
 
 The server embeds `web/dist` at compile time (`crates/server/build.rs`), so rebuild it after
 rebuilding the web app. `web/e2e/run.ts` starts its own server on a temporary data directory.
@@ -59,7 +61,7 @@ rebuilding the web app. `web/e2e/run.ts` starts its own server on a temporary da
 ## Rules that are easy to miss
 
 - All cryptography, payload formats and merging live in `crates/core` only. Clients never
-  reimplement them; the web app reaches them through WASM, Android through `crates/android`.
+  reimplement them; the web app reaches them through WASM, the native apps through `crates/native`.
   Logic both bridges need (editing, resolving, read models) goes into core, not into a bridge.
 - The web app runs under a strict CSP: no inline scripts or `style="…"` attributes, no Svelte
   transitions, no `data:` URLs (details in `web/README.md`).

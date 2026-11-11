@@ -4,7 +4,7 @@ import memo.ui.BackendException
 import org.json.JSONObject
 import org.json.JSONTokener
 
-/** A reply from crates/android: JSON (a JSONObject, JSONArray, String, Number, Boolean or null) and bytes. */
+/** A reply from crates/native: JSON (a JSONObject, JSONArray, String, Number, Boolean or null) and bytes. */
 class Reply(private val value: Any?, val data: ByteArray?) {
     val obj get() = value as JSONObject
     val array get() = value as org.json.JSONArray

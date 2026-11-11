@@ -37,3 +37,30 @@ export function download(bytes: Uint8Array | string, name: string, type = "appli
   link.click();
   setTimeout(() => URL.revokeObjectURL(url), 10_000);
 }
+
+/** Local midnight of the day `ms` falls on. */
+export function dayStart(ms: number): number {
+  const date = new Date(ms);
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate()).getTime();
+}
+
+/** Local midnight of the next day. */
+export function nextDay(day: number): number {
+  const date = new Date(day);
+  return new Date(date.getFullYear(), date.getMonth(), date.getDate() + 1).getTime();
+}
+
+/** "Today", "Yesterday", "Monday 3 November", with the year if it is not this year. */
+export function dayLabel(ms: number, now = Date.now()): string {
+  const day = dayStart(ms);
+  const today = dayStart(now);
+  if (day === today) return "Today";
+  if (nextDay(day) === today) return "Yesterday";
+  const sameYear = new Date(day).getFullYear() === new Date(today).getFullYear();
+  return new Date(day).toLocaleDateString([], {
+    weekday: "long",
+    day: "numeric",
+    month: "long",
+    year: sameYear ? undefined : "numeric",
+  });
+}

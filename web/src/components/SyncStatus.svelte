@@ -11,6 +11,8 @@
   const text = $derived.by(() => {
     const s = app.sync;
     if (s.syncing) return "Syncing…";
+    // The server refuses writes from a page opened at another address than its public_url.
+    if (s.error === "origin not allowed") return "Not synced: open memo at the server's public address";
     if (s.error) return "Not synced: retrying";
     if (s.unsynced) return "Changes not synced yet";
     if (s.last) return `Synced ${when(s.last, tick)}`;

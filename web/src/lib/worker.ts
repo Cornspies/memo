@@ -5,6 +5,7 @@
 import init, * as wasm from "../wasm/memo.js";
 import wasmUrl from "../wasm/memo_bg.wasm?url";
 import * as http from "./http";
+import { exportPaths, extension, linkExported } from "./exported";
 import { prepareImage } from "./images";
 import type {
   AttachedImage,
@@ -17,7 +18,9 @@ import type {
   MemoSummary,
   Permission,
   RevisionInfo,
+  SavedFilter,
   Session,
+  Stats,
   SyncEvent,
   SyncStatus,
   TagCount,
@@ -279,7 +282,9 @@ async function syncOnce(current: wasm.Client): Promise<SyncEvent[]> {
 function edited() {
   emit({ type: "changed" });
   setStatus({ unsynced: client?.has_unsynced() ?? false });
-  scheduleSync(EDIT_DELAY);
+  // A round already running pushed what was dirty when it started: run one more after it.
+  if (running) again = true;
+  else scheduleSync(EDIT_DELAY);
 }
 
 scope.addEventListener("online", () => scheduleSync(0));
@@ -317,8 +322,23 @@ async function attachment(memoId: string, attachmentId: string, kind: Attachment
   return { bytes, renderable: mime !== undefined && wasm.image_renderable(bytes, mime) };
 }
 
+async function clean(bytes: Uint8Array) {
+  const image = wasm.clean_image(bytes);
+  try {
+    return {
+      mime: image.mime(),
+      width: image.width(),
+      height: image.height(),
+      orientation: image.orientation(),
+      bytes: image.bytes(),
+    };
+  } finally {
+    image.free();
+  }
+}
+
 async function attachImage(memoId: string, file: Blob, maxSide: number | null): Promise<AttachedImage> {
-  const image = await prepareImage(file, maxSide);
+  const image = await prepareImage(file, maxSide, clean);
   const id = unlocked().add_attachment(
     memoId,
     image.mime,
@@ -375,18 +395,6 @@ async function prelogin(): Promise<string> {
 
 // ---- Export ----
 
-function extension(mime: string) {
-  return { "image/jpeg": "jpg", "image/png": "png", "image/webp": "webp", "image/gif": "gif" }[mime] ?? "bin";
-}
-
-function fileName(title: string, id: string) {
-  const slug = title
-    .replace(/[\\/:*?"<>|#\u0000-\u001f]/g, "")
-    .trim()
-    .slice(0, 60);
-  return `${slug || "untitled"} (${id.slice(-8)})`;
-}
-
 async function exportAll(): Promise<Uint8Array> {
   const current = unlocked();
   const files: { name: string; bytes: Uint8Array }[] = [];
@@ -395,18 +403,19 @@ async function exportAll(): Promise<Uint8Array> {
     ...JSON.parse(current.memo_list(JSON.stringify({}))),
     ...JSON.parse(current.memo_list(JSON.stringify({ archived: true }))),
   ];
+  const paths = exportPaths(all);
   for (const summary of all) {
     const detail: MemoDetail = JSON.parse(current.memo_detail(summary.id));
-    let body = detail.body;
+    const up = detail.archived ? "../" : "";
+    let body = linkExported(detail.body, paths, up);
     for (const a of detail.attachments) {
       const name = `images/${a.id}.${extension(a.mime)}`;
       const image = await attachment(detail.id, a.id, "original").catch(() => null);
       if (!image) continue;
       files.push({ name, bytes: image.bytes });
-      body = body.replaceAll(`attachment:${a.id}`, name);
+      body = body.replaceAll(`attachment:${a.id}`, up + name);
     }
-    const folder = detail.archived ? "archive/" : "";
-    files.push({ name: `${folder}${fileName(detail.title, detail.id)}.md`, bytes: encoder.encode(body) });
+    files.push({ name: paths.get(detail.id)!, bytes: encoder.encode(body) });
   }
   return zip(files);
 }
@@ -431,6 +440,18 @@ const methods = {
   poke: () => scheduleSync(0),
   list: (filter: MemoFilter): MemoSummary[] => JSON.parse(unlocked().memo_list(JSON.stringify(filter))),
   tags: (): TagCount[] => JSON.parse(unlocked().tag_counts()),
+  activity: (): number[] => JSON.parse(unlocked().activity()),
+  stats: (): Stats => JSON.parse(unlocked().stats()),
+  savedFilters: (): SavedFilter[] => JSON.parse(unlocked().saved_filters()),
+  saveFilter: (name: string, filter: MemoFilter) => {
+    const id = unlocked().save_filter(name, JSON.stringify(filter));
+    edited();
+    return id;
+  },
+  deleteFilter: (id: string) => {
+    unlocked().delete_filter(id);
+    edited();
+  },
   memo: (id: string): MemoDetail => JSON.parse(unlocked().memo_detail(id)),
   render: async (body: string) => {
     await ready;

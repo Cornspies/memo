@@ -8,14 +8,18 @@
 //! - `<input type="checkbox" data-task="<offset>">`: a task box; [`text::toggle_task`](crate::text::toggle_task)
 //!   flips it in the source.
 //! - `<span class="tag" data-tag="<lowercased>">#Tag</span>`.
+//! - `<a class="memo-link" data-memo="<id>" href="#/memo/<id>">`: a link to another memo.
+//! - `<span class="hl-keyword">` and the other [`Token`] classes in highlighted code.
 
-use pulldown_cmark::{CowStr, Event, Options, Parser, Tag, TagEnd, html};
+use pulldown_cmark::{CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd, html};
 use uuid::Uuid;
 
-use crate::text::{ATTACHMENT_SCHEME, find_tags};
+use crate::text::{ATTACHMENT_SCHEME, MEMO_SCHEME, find_tags};
 
 pub mod blocks;
+pub mod highlight;
 pub use blocks::to_blocks;
+pub use highlight::Token;
 
 const SAFE_SCHEMES: [&str; 3] = ["http", "https", "mailto"];
 const OPTIONS: Options = Options::ENABLE_TABLES.union(Options::ENABLE_STRIKETHROUGH).union(Options::ENABLE_TASKLISTS);
@@ -26,7 +30,21 @@ pub fn to_html(body: &str) -> String {
     let mut links: Vec<bool> = Vec::new();
     let mut image: Option<(CowStr, String)> = None;
     let (mut in_code, mut boundary) = (false, true);
+    // A fenced block with a language: its text, collected to highlight at the end.
+    let mut code: Option<(String, String)> = None;
     for (event, range) in Parser::new_ext(body, OPTIONS).into_offset_iter() {
+        if let Some((language, text)) = &mut code {
+            match event {
+                Event::Text(t) => text.push_str(&t),
+                Event::End(TagEnd::CodeBlock) => {
+                    events.push(Event::Html(code_html(language, text).into()));
+                    code = None;
+                    in_code = false;
+                }
+                _ => {}
+            }
+            continue;
+        }
         if let Some((_, alt)) = &mut image {
             match event {
                 Event::Text(t) | Event::Code(t) => alt.push_str(&t),
@@ -42,18 +60,26 @@ pub fn to_html(body: &str) -> String {
             Event::Start(Tag::Image { dest_url, .. }) => image = Some((dest_url, String::new())),
             Event::Start(Tag::Link { dest_url, .. }) => {
                 let safe = is_safe_url(&dest_url);
-                if safe {
+                if let Some(id) = memo_link(&dest_url) {
+                    events.push(Event::InlineHtml(
+                        format!(r##"<a class="memo-link" data-memo="{id}" href="#/memo/{id}">"##).into(),
+                    ));
+                } else if safe {
                     let href = escape(&dest_url);
                     events.push(Event::InlineHtml(
                         format!(r#"<a href="{href}" rel="noopener noreferrer nofollow" target="_blank">"#).into(),
                     ));
                 }
-                links.push(safe);
+                links.push(safe || memo_link(&dest_url).is_some());
             }
             Event::End(TagEnd::Link) => {
                 if links.pop() == Some(true) {
                     events.push(Event::InlineHtml("</a>".into()));
                 }
+            }
+            Event::Start(Tag::CodeBlock(CodeBlockKind::Fenced(ref info))) if !language(info).is_empty() => {
+                in_code = true;
+                code = Some((language(info).to_owned(), String::new()));
             }
             Event::Start(Tag::CodeBlock(_)) => {
                 in_code = true;
@@ -112,6 +138,33 @@ fn push_text_with_tags<'a>(events: &mut Vec<Event<'a>>, text: &str, boundary: bo
     if last < text.len() {
         events.push(Event::Text(text[last..].to_owned().into()));
     }
+}
+
+/// The language of a fenced block: the info string's first word.
+fn language(info: &str) -> &str {
+    info.split_whitespace().next().unwrap_or("")
+}
+
+/// The id of a `memo:<id>` link.
+fn memo_link(url: &str) -> Option<Uuid> {
+    url.strip_prefix(MEMO_SCHEME).and_then(|id| Uuid::try_parse(id).ok())
+}
+
+fn code_html(language: &str, code: &str) -> String {
+    let mut out = format!(r#"<pre><code class="language-{}">"#, escape(language));
+    match highlight::highlight(code, language) {
+        Some(runs) => {
+            for (token, text) in runs {
+                match token {
+                    Some(token) => out.push_str(&format!(r#"<span class="{}">{}</span>"#, token.class(), escape(text))),
+                    None => out.push_str(&escape(text)),
+                }
+            }
+        }
+        None => out.push_str(&escape(code)),
+    }
+    out.push_str("</code></pre>\n");
+    out
 }
 
 fn image_html(url: &str, alt: &str) -> String {
@@ -190,6 +243,24 @@ mod tests {
         );
         assert!(html.contains(r#"<a class="remote-image" href="https://evil.example/p.gif""#), "{html}");
         assert!(!html.contains("<img src") && !html.contains("data:image"), "{html}");
+    }
+
+    #[test]
+    fn memo_links_and_code() {
+        let id = "0192f3c4-7a1b-7c2d-9e8f-0a1b2c3d4e5f";
+        let html = to_html(&format!(
+            "[Groceries](memo:{id}) [bad](memo:nope)\n\n```rust title\nlet s = \"<b>\";\n```\n\n```\nplain <i>\n```"
+        ));
+        assert!(
+            html.contains(&format!(r##"<a class="memo-link" data-memo="{id}" href="#/memo/{id}">Groceries</a>"##)),
+            "{html}"
+        );
+        assert!(!html.contains("memo:nope"), "{html}");
+        assert!(html.contains(r#"<pre><code class="language-rust"><span class="hl-keyword">let</span>"#), "{html}");
+        assert!(html.contains(r#"<span class="hl-string">&quot;&lt;b&gt;&quot;</span>"#), "{html}");
+        assert!(html.contains("<pre><code>plain &lt;i&gt;\n</code></pre>"), "{html}");
+        let unknown = to_html("```nosuchlang\n<x>\n```");
+        assert!(unknown.contains("<pre><code class=\"language-nosuchlang\">&lt;x&gt;\n</code></pre>"), "{unknown}");
     }
 
     #[test]

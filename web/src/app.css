@@ -17,27 +17,42 @@
   --shadow: 0 8px 30px #0000001f;
   --font: system-ui, -apple-system, "Segoe UI", Roboto, "Noto Sans", Ubuntu, Cantarell, sans-serif;
   --mono: ui-monospace, "SF Mono", "Cascadia Mono", "JetBrains Mono", Menlo, Consolas, monospace;
-  color-scheme: light dark;
+  /* Code highlighting (memo_core::render::Token). */
+  --hl-comment: #6b716d;
+  --hl-string: #2f7a3b;
+  --hl-number: #a3501f;
+  --hl-constant: #a3501f;
+  --hl-keyword: #7a3e9d;
+  --hl-function: #245f9e;
+  --hl-type: #8a5a00;
+  color-scheme: light;
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #161917;
-    --surface: #1d211f;
-    --surface-2: #252a27;
-    --border: #323834;
-    --text: #e6e9e7;
-    --muted: #98a09b;
-    --accent: #6cc2a5;
-    --accent-text: #0f1a16;
-    --accent-soft: #23362f;
-    --warning: #f0c060;
-    --warning-soft: #3a3020;
-    --danger: #f08a80;
-    --danger-soft: #3d2422;
-    --focus: #6cc2a566;
-    --shadow: 0 8px 30px #00000080;
-  }
+/* Set by src/lib/theme.ts from the setting, or from the system. */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #161917;
+  --surface: #1d211f;
+  --surface-2: #252a27;
+  --border: #323834;
+  --text: #e6e9e7;
+  --muted: #98a09b;
+  --accent: #6cc2a5;
+  --accent-text: #0f1a16;
+  --accent-soft: #23362f;
+  --warning: #f0c060;
+  --warning-soft: #3a3020;
+  --danger: #f08a80;
+  --danger-soft: #3d2422;
+  --focus: #6cc2a566;
+  --shadow: 0 8px 30px #00000080;
+  --hl-comment: #868e89;
+  --hl-string: #9fd39a;
+  --hl-number: #f0a878;
+  --hl-constant: #f0a878;
+  --hl-keyword: #cfa2ee;
+  --hl-function: #8cc0f2;
+  --hl-type: #f0c878;
 }
 
 * {
@@ -324,6 +339,29 @@ dialog::backdrop {
 .markdown pre code {
   background: none;
   padding: 0;
+}
+
+.markdown .hl-comment {
+  color: var(--hl-comment);
+  font-style: italic;
+}
+.markdown .hl-string {
+  color: var(--hl-string);
+}
+.markdown .hl-number {
+  color: var(--hl-number);
+}
+.markdown .hl-constant {
+  color: var(--hl-constant);
+}
+.markdown .hl-keyword {
+  color: var(--hl-keyword);
+}
+.markdown .hl-function {
+  color: var(--hl-function);
+}
+.markdown .hl-type {
+  color: var(--hl-type);
 }
 
 .markdown pre.html {

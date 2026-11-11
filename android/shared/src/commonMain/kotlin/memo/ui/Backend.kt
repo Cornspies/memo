@@ -31,6 +31,13 @@ interface Backend {
 
     suspend fun list(filter: MemoFilter): List<MemoSummary>
     suspend fun tags(): List<TagCount>
+    /** Creation times of the memos in the main list, oldest first. */
+    suspend fun activity(): List<Long>
+    suspend fun stats(): Stats
+    suspend fun savedFilters(): List<SavedFilter>
+    /** Saves the filter's query, tag and quick filters under `name`. Returns the new id. */
+    suspend fun saveFilter(name: String, filter: MemoFilter): String
+    suspend fun deleteFilter(id: String)
     suspend fun memo(id: String): MemoDetail
     suspend fun render(body: String): List<Block>
     /** `kind`: `original` or `thumbnail`. Null if not available yet (not uploaded, or offline). */
@@ -67,6 +74,8 @@ interface Backend {
 
     /** Downscale images to 2560 px on the longest side before attaching (default on). */
     var downscale: Boolean
+    /** `system`, `light` or `dark`, on this device. */
+    var theme: String
 }
 
 /** Errors from the backend: `code` is an API error code or a memo-core error name. */
@@ -79,7 +88,27 @@ interface Platform {
     /** Asks where to save the file. False if cancelled. */
     suspend fun saveFile(name: String, mime: String, bytes: ByteArray): Boolean
     fun copy(text: String)
+    /** Light or dark status and navigation bar icons, to match the app's theme. */
+    fun darkBars(dark: Boolean)
     fun dateTime(ms: Long): String
+    /** "11 Nov 2026". */
+    fun date(ms: Long): String
     /** "5 minutes ago". */
     fun relative(ms: Long): String
+
+    // Local calendar days, as the local midnight in Unix ms.
+
+    fun today(): Long
+    fun dayStart(ms: Long): Long
+    /** The day `days` after `day`. */
+    fun addDays(day: Long, days: Int): Long
+    /** The first day of the month `months` after the one `day` falls in. */
+    fun monthStart(day: Long, months: Int = 0): Long
+    /** 1 for Monday to 7 for Sunday. */
+    fun weekday(day: Long): Int
+    fun dayOfMonth(day: Long): Int
+    /** "November 2026". */
+    fun monthName(day: Long): String
+    /** "Today", "Yesterday", or "Monday, 3 November" (with the year if not this year). */
+    fun dayLabel(day: Long): String
 }

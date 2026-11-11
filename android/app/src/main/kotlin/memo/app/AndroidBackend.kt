@@ -11,6 +11,8 @@ import androidx.compose.ui.graphics.asImageBitmap
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.net.URLEncoder
+import java.time.Instant
+import java.time.ZoneId
 import java.util.zip.ZipEntry
 import java.util.zip.ZipOutputStream
 import kotlin.math.min
@@ -37,7 +39,9 @@ import memo.ui.MemoDetail
 import memo.ui.MemoFilter
 import memo.ui.MemoSummary
 import memo.ui.RevisionInfo
+import memo.ui.SavedFilter
 import memo.ui.Session
+import memo.ui.Stats
 import memo.ui.SyncEvent
 import memo.ui.SyncStatus
 import memo.ui.TagCount
@@ -77,6 +81,10 @@ class AndroidBackend(private val context: Context) : Backend {
     override var downscale: Boolean
         get() = prefs.getBoolean("downscale", true)
         set(value) = prefs.edit().putBoolean("downscale", value).apply()
+
+    override var theme: String
+        get() = prefs.getString("theme", "system") ?: "system"
+        set(value) = prefs.edit().putString("theme", value).apply()
 
     // Declared before `init`, which starts the sync loop.
     private val requests = Channel<CompletableDeferred<Unit>>(Channel.UNLIMITED)
@@ -375,17 +383,52 @@ class AndroidBackend(private val context: Context) : Backend {
         version.update { it + 1 }
         val unsynced = core { Core.call("has_unsynced").bool }
         sync.update { it.copy(unsynced = unsynced) }
-        schedule(EDIT_DELAY)
+        // A round already running pushed what was dirty when it started: queue one more after it.
+        if (sync.value.syncing) requests.trySend(CompletableDeferred()) else schedule(EDIT_DELAY)
     }
 
     // ---- Memos ----
 
     override suspend fun list(filter: MemoFilter): List<MemoSummary> = core {
-        val json = JSONObject().put("query", filter.query).put("tag", filter.tag ?: JSONObject.NULL).put("archived", filter.archived)
-        Core.call("memo_list", "filter" to json).array.map { it.toSummary() }
+        Core.call("memo_list", "filter" to filterJson(filter)).array.map { it.toSummary() }
+    }
+
+    /** `memo_core::sync::MemoFilter`: the calendar day becomes the range from its midnight to the next. */
+    private fun filterJson(filter: MemoFilter): JSONObject {
+        val zone = ZoneId.systemDefault()
+        val nextDay = filter.day?.let {
+            Instant.ofEpochMilli(it).atZone(zone).toLocalDate().plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
+        }
+        return JSONObject()
+            .put("query", filter.query)
+            .put("tag", filter.tag ?: JSONObject.NULL)
+            .put("archived", filter.archived)
+            .put("has", JSONArray(filter.has))
+            .put("created_from", filter.day ?: JSONObject.NULL)
+            .put("created_before", nextDay ?: JSONObject.NULL)
     }
 
     override suspend fun tags(): List<TagCount> = core { Core.call("tag_counts").array.map { it.toTagCount() } }
+
+    override suspend fun activity(): List<Long> = core {
+        val times = Core.call("activity").array
+        (0 until times.length()).map { times.getLong(it) }
+    }
+
+    override suspend fun stats(): Stats = core { Core.call("stats").obj.toStats() }
+
+    override suspend fun savedFilters(): List<SavedFilter> = core { Core.call("saved_filters").array.map { it.toSavedFilter() } }
+
+    override suspend fun saveFilter(name: String, filter: MemoFilter): String {
+        val id = core { Core.call("save_filter", "name" to name, "filter" to filterJson(filter)).string }
+        edited()
+        return id
+    }
+
+    override suspend fun deleteFilter(id: String) {
+        core { Core.call("delete_filter", "filter_id" to id) }
+        edited()
+    }
 
     override suspend fun memo(id: String): MemoDetail = core { Core.call("memo_detail", "memo_id" to id).obj.toDetail() }
 
@@ -631,23 +674,40 @@ class AndroidBackend(private val context: Context) : Backend {
         return "${slug.ifEmpty { "untitled" }} (${id.takeLast(8)})"
     }
 
+    /**
+     * Points `memo:<id>` links at the exported files (as web/src/lib/exported.ts does). `up` leads
+     * from the memo's folder to the export's root.
+     */
+    private fun linkExported(body: String, paths: Map<String, String>, up: String): String =
+        Regex("\\(memo:([0-9a-f-]{36})|<memo:([0-9a-f-]{36})>").replace(body) { match ->
+            val inline = match.groupValues[1].ifEmpty { null }
+            val path = paths[inline ?: match.groupValues[2]] ?: return@replace match.value
+            val target = up + path.split("/").joinToString("/") { part ->
+                URLEncoder.encode(part, "UTF-8").replace("+", "%20").replace("(", "%28").replace(")", "%29")
+            }
+            // `<path>` is no autolink without a scheme: name it.
+            val name = path.substringAfterLast('/').removeSuffix(".md").replace(Regex("[\\[\\]]")) { "\\${it.value}" }
+            if (inline != null) "($target" else "[$name]($target)"
+        }
+
     override suspend fun exportAll(): ByteArray {
         val all = list(MemoFilter()) + list(MemoFilter(archived = true))
+        val paths = all.associate { it.id to "${if (it.archived) "archive/" else ""}${fileName(it.title, it.id)}.md" }
         val out = ByteArrayOutputStream()
         ZipOutputStream(out).use { zip ->
             for (summary in all) {
                 val detail = memo(summary.id)
-                var body = detail.body
+                val up = if (summary.archived) "../" else ""
+                var body = linkExported(detail.body, paths, up)
                 for (a in detail.attachments) {
                     val name = "images/${a.id}.${extension(a.mime)}"
                     val bytes = runCatching { attachmentBytes(detail.id, a.id, "original") }.getOrNull() ?: continue
                     zip.putNextEntry(ZipEntry(name))
                     zip.write(bytes)
                     zip.closeEntry()
-                    body = body.replace("attachment:${a.id}", name)
+                    body = body.replace("attachment:${a.id}", up + name)
                 }
-                val folder = if (summary.archived) "archive/" else ""
-                zip.putNextEntry(ZipEntry("$folder${fileName(summary.title, summary.id)}.md"))
+                zip.putNextEntry(ZipEntry(paths.getValue(summary.id)))
                 zip.write(body.toByteArray())
                 zip.closeEntry()
             }

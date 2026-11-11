@@ -59,11 +59,47 @@ data class MemoDetail(
     val members: List<MemberView>,
     val attachments: List<AttachmentView>,
     val conflictWith: ConflictWith?,
+    /** Memos that link to this one. */
+    val linkedFrom: List<MemoLink>,
 ) {
     val id get() = summary.id
 }
 
-data class MemoFilter(val query: String = "", val tag: String? = null, val archived: Boolean = false)
+data class MemoLink(val id: String, val title: String)
+
+/** `day` is a day picked in the calendar (local midnight, Unix ms). `has` holds quick filters. */
+data class MemoFilter(
+    val query: String = "",
+    val tag: String? = null,
+    val archived: Boolean = false,
+    val has: List<String> = emptyList(),
+    val day: Long? = null,
+) {
+    val narrowed get() = archived || tag != null || has.isNotEmpty() || day != null || query.isNotBlank()
+
+    fun isSaved(saved: SavedFilter) =
+        !archived && day == null && query.trim() == saved.query.trim() && tag == saved.tag && has.toSet() == saved.has.toSet()
+}
+
+/** The quick filters: what a memo must contain (`docs/crypto.md#vault-payload`). */
+val QuickFilters = listOf("open_tasks" to "Open tasks", "tasks" to "Tasks", "links" to "Links", "images" to "Images", "code" to "Code")
+
+data class SavedFilter(val id: String, val name: String, val query: String, val tag: String?, val has: List<String>) {
+    fun toFilter() = MemoFilter(query = query, tag = tag, has = has)
+}
+
+/** Counts over the memo list (the archive only as `archived`). */
+data class Stats(
+    val memos: Int,
+    val archived: Int,
+    val words: Int,
+    val tags: Int,
+    val images: Int,
+    val openTasks: Int,
+    val doneTasks: Int,
+    val shared: Int,
+    val since: Long?,
+)
 
 data class TagCount(val tag: String, val count: Int)
 
@@ -142,7 +178,8 @@ sealed interface Block {
 
     data class ListBlock(val start: Long?, val items: List<ListItem>) : Block
 
-    data class Code(val text: String) : Block
+    /** `spans` split `text` by highlight token (null: plain) when the language is known. */
+    data class Code(val text: String, val spans: List<CodeSpan> = emptyList()) : Block
 
     data class Table(val head: List<List<Inline>>, val rows: List<List<List<Inline>>>) : Block
 
@@ -150,6 +187,9 @@ sealed interface Block {
 }
 
 data class ListItem(val task: Task?, val blocks: List<Block>)
+
+/** `token`: `comment`, `string`, `number`, `constant`, `keyword`, `function` or `type`. */
+data class CodeSpan(val text: String, val token: String?)
 
 /** `offset` goes to [Backend.toggleTask]. */
 data class Task(val checked: Boolean, val offset: Int)

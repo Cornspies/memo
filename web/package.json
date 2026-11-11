@@ -9,7 +9,8 @@
     "dev": "vite",
     "build": "sh build-wasm.sh && vite build",
     "check": "svelte-check --tsconfig ./tsconfig.json",
-    "e2e": "bun e2e/run.ts"
+    "e2e": "bun e2e/run.ts",
+    "e2e:desktop": "bun e2e/desktop.ts"
   },
   "devDependencies": {
     "@sveltejs/vite-plugin-svelte": "7.3.1",

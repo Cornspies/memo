@@ -5,13 +5,19 @@ import android.content.ClipboardManager
 import android.net.Uri
 import android.os.Bundle
 import android.text.format.DateUtils
+import android.graphics.Color
 import androidx.activity.ComponentActivity
+import androidx.activity.SystemBarStyle
 import androidx.activity.OnBackPressedCallback
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import java.text.DateFormat
+import java.time.Instant
+import java.time.LocalDate
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 import java.util.Date
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.Dispatchers
@@ -85,6 +91,12 @@ class MainActivity : ComponentActivity(), Platform {
         return true
     }
 
+    override fun darkBars(dark: Boolean) {
+        val style =
+            if (dark) SystemBarStyle.dark(Color.TRANSPARENT) else SystemBarStyle.light(Color.TRANSPARENT, Color.TRANSPARENT)
+        enableEdgeToEdge(style, style)
+    }
+
     override fun copy(text: String) {
         val clip = ClipData.newPlainText("memo", text)
         // Recovery keys: keep them out of the clipboard preview.
@@ -96,6 +108,37 @@ class MainActivity : ComponentActivity(), Platform {
     }
 
     override fun dateTime(ms: Long): String = DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(ms))
+
+    override fun date(ms: Long): String = DateFormat.getDateInstance(DateFormat.MEDIUM).format(Date(ms))
+
+    private fun local(ms: Long): LocalDate = Instant.ofEpochMilli(ms).atZone(ZoneId.systemDefault()).toLocalDate()
+
+    private fun LocalDate.ms(): Long = atStartOfDay(ZoneId.systemDefault()).toInstant().toEpochMilli()
+
+    override fun today() = LocalDate.now().ms()
+
+    override fun dayStart(ms: Long) = local(ms).ms()
+
+    override fun addDays(day: Long, days: Int) = local(day).plusDays(days.toLong()).ms()
+
+    override fun monthStart(day: Long, months: Int) = local(day).withDayOfMonth(1).plusMonths(months.toLong()).ms()
+
+    override fun weekday(day: Long) = local(day).dayOfWeek.value
+
+    override fun dayOfMonth(day: Long) = local(day).dayOfMonth
+
+    override fun monthName(day: Long): String = DateTimeFormatter.ofPattern("LLLL yyyy").format(local(day))
+
+    override fun dayLabel(day: Long): String {
+        val date = local(day)
+        val today = LocalDate.now()
+        return when (date) {
+            today -> "Today"
+            today.minusDays(1) -> "Yesterday"
+            else ->
+                DateTimeFormatter.ofPattern(if (date.year == today.year) "EEEE, d MMMM" else "EEEE, d MMMM yyyy").format(date)
+        }
+    }
 
     override fun relative(ms: Long): String {
         // Clocks differ a little between devices: nothing is in the future.

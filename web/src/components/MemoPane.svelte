@@ -1,11 +1,12 @@
 <script lang="ts">
   import { untrack } from "svelte";
   import { dateTime, when } from "../lib/format";
-  import { app, backend, errorCode, errorText, filter, go, toast } from "../lib/state.svelte";
-  import type { AttachmentView, MemoDetail } from "../lib/types";
+  import { app, backend, clearFilter, errorCode, errorText, filter, go, toast } from "../lib/state.svelte";
+  import type { AttachmentView, MemoDetail, MemoSummary } from "../lib/types";
   import ConflictView from "./ConflictView.svelte";
   import HistoryDialog from "./HistoryDialog.svelte";
   import Lightbox from "./Lightbox.svelte";
+  import LinkDialog from "./LinkDialog.svelte";
   import Rendered from "./Rendered.svelte";
   import ShareDialog from "./ShareDialog.svelte";
 
@@ -23,7 +24,7 @@
   let saved = "";
   let saveTimer: ReturnType<typeof setTimeout> | undefined;
   let textarea = $state<HTMLTextAreaElement | null>(null);
-  let dialog = $state<"share" | "history" | null>(null);
+  let dialog = $state<"share" | "history" | "link" | null>(null);
   let viewing = $state<AttachmentView | null>(null);
   let attaching = $state(0);
   let fileInput = $state<HTMLInputElement>();
@@ -133,6 +134,22 @@
     queueMicrotask(() => area?.setSelectionRange(cursor, cursor));
   }
 
+  /** Inserts a link to `target` at the cursor, as `[title](memo:<id>)`. */
+  function link(target: MemoSummary) {
+    dialog = null;
+    const label = (target.title || "Untitled").replace(/[\\[\]]/g, "\\$&");
+    const snippet = `[${label}](memo:${target.id})`;
+    const start = textarea?.selectionStart ?? text.length;
+    const end = textarea?.selectionEnd ?? text.length;
+    text = text.slice(0, start) + snippet + text.slice(end);
+    const cursor = start + snippet.length;
+    queueMicrotask(() => {
+      textarea?.focus();
+      textarea?.setSelectionRange(cursor, cursor);
+    });
+    changed();
+  }
+
   async function attach(files: Iterable<File>) {
     for (const file of files) {
       if (!file.type.startsWith("image/")) continue;
@@ -205,8 +222,8 @@
   }
 
   function showTag(tag: string) {
+    clearFilter();
     filter.tag = tag;
-    filter.archived = false;
     go("/");
   }
 </script>
@@ -227,6 +244,7 @@
         <button onclick={() => fileInput?.click()} disabled={attaching > 0}>
           {attaching ? "Adding image…" : "Add image"}
         </button>
+        <button onclick={() => (dialog = "link")}>Link memo</button>
       {:else if writable}
         <button class="primary" onclick={startEdit}>Edit</button>
       {/if}
@@ -306,6 +324,14 @@
           <p class="muted">Empty memo.</p>
         {/if}
       {/if}
+      {#if memo.linked_from.length && !editing}
+        <nav class="backlinks small-text" aria-label="Linked from">
+          <span class="muted">Linked from</span>
+          {#each memo.linked_from as from (from.id)}
+            <button class="ghost small" onclick={() => go(`/memo/${from.id}`)}>{from.title || "Untitled"}</button>
+          {/each}
+        </nav>
+      {/if}
     </div>
 
     <footer class="small-text muted">
@@ -338,6 +364,8 @@
     <ShareDialog {memo} onclose={() => (dialog = null)} />
   {:else if dialog === "history"}
     <HistoryDialog {memo} onclose={() => (dialog = null)} />
+  {:else if dialog === "link"}
+    <LinkDialog exclude={id} onpick={link} onclose={() => (dialog = null)} />
   {/if}
   {#if viewing}
     <Lightbox memoId={id} attachment={viewing} onclose={() => (viewing = null)} />
@@ -388,6 +416,19 @@
   }
   .editor:focus-visible {
     outline: none;
+  }
+  .backlinks {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 4px;
+    max-width: 760px;
+    margin-top: 32px;
+    padding-top: 10px;
+    border-top: 1px solid var(--border);
+  }
+  .backlinks button {
+    color: var(--accent);
   }
   footer {
     padding: 8px 18px;

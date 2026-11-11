@@ -250,6 +250,7 @@ try {
   section("archive and export");
   await alice.button("Archive", ".toolbar");
   await alice.until(`!document.querySelector(".item")`, "archived out of the list");
+  await synced(alice);
   await alice.button("Archive", ".sidebar");
   await alice.until(`document.querySelector(".item")`, "archive view");
   check((await alice.text(".items"))?.includes("Groceries"), "memo is in the archive");
@@ -290,6 +291,71 @@ try {
   await alice.click("form button.primary");
   await alice.until(`document.querySelector(".sidebar")`, "unlocked with the new password", 30000);
   check(true, "the new password unlocks");
+
+  section("timeline, links, filters, calendar and stats");
+  const items = () => alice.eval(`[...document.querySelectorAll(".item .title")].map((t) => t.innerText)`);
+  const newMemo = async (body: string) => {
+    await alice.button("New memo");
+    await alice.until(`document.querySelector("textarea.editor")`, "editor");
+    await alice.fill("textarea.editor", body);
+    await sleep(300);
+  };
+  await newMemo("# Snippet\n\n```rust\nfn main() {}\n```\n\n- [ ] try it");
+  await alice.button("Done");
+  await alice.until(`document.querySelector(".markdown .hl-keyword")`, "highlighted code");
+  check((await alice.text(".markdown .hl-keyword")) === "fn", "code is highlighted");
+  await newMemo("# Index\n\nSee ");
+  await alice.button("Link memo");
+  await alice.until(`[...document.querySelectorAll("dialog .results button")].some((b) => b.innerText.includes("Snippet"))`, "memo picker");
+  await alice.eval(`[...document.querySelectorAll("dialog .results button")].find((b) => b.innerText.includes("Snippet")).click()`);
+  await alice.until(`document.querySelector("textarea.editor").value.includes("[Snippet](memo:")`, "link inserted");
+  await sleep(500);
+  await alice.button("Done");
+  await alice.until(`document.querySelector(".markdown a.memo-link")`, "memo link");
+  await synced(alice);
+  await alice.click(".markdown a.memo-link");
+  await alice.until(`document.querySelector(".markdown h1")?.innerText === "Snippet"`, "the link opens the memo");
+  await alice.until(`document.querySelector(".backlinks")?.innerText.includes("Index")`, "backlink");
+  check(true, "a memo link opens its memo, which lists the backlink");
+  await shot(alice, "07-links");
+
+  check((await alice.text(".items .group")) === "Today", "the list is grouped by day");
+  await alice.button("Code", ".quick");
+  await alice.until(`document.querySelectorAll(".item").length === 1`, "quick filter");
+  check((await items())[0] === "Snippet", "the code filter shows only the memo with code");
+  await alice.button("Save", ".filter");
+  await alice.until(`document.querySelector("dialog input[type=text]")`, "save dialog");
+  await alice.fill("dialog input[type=text]", "With code");
+  await alice.click("dialog form button.primary");
+  await alice.until(`document.querySelector(".saved")?.innerText.includes("With code")`, "saved filter in the sidebar");
+  await alice.button("Clear", ".filter");
+  await alice.until(`document.querySelectorAll(".item").length === 2`, "filter cleared");
+  await alice.button("With code", ".sidebar");
+  await alice.until(`document.querySelectorAll(".item").length === 1`, "saved filter applied");
+  check(true, "a quick filter can be saved and applied again");
+
+  await alice.button("Clear", ".filter");
+  await alice.click(".calendar .day.today");
+  await alice.until(`document.querySelector(".filter") && document.querySelectorAll(".item").length === 2`, "calendar day");
+  check(true, "picking today in the calendar shows today's memos");
+  await shot(alice, "08-calendar");
+  await alice.button("Clear", ".filter");
+
+  await alice.button("Settings");
+  await alice.until(`document.querySelector(".stats")`, "statistics");
+  const stats = await alice.eval(`Object.fromEntries([...document.querySelectorAll(".stats div")].map((d) => [d.querySelector("dt").innerText, d.querySelector("dd").innerText]))`);
+  check(stats.Memos === "2" && stats["Days with memos"] === "1" && stats.Archived === "1" && stats["Tasks done"] === "0 of 1", `statistics (${JSON.stringify(stats)})`);
+  await alice.button("Dark", ".themes");
+  await alice.until(`document.documentElement.dataset.theme === "dark"`, "dark theme");
+  check((await alice.eval(`getComputedStyle(document.body).backgroundColor`)) !== "rgb(255, 255, 255)", "the dark theme can be chosen");
+  await alice.eval(`location.hash = "#/"`);
+  await open(alice, "try it");
+  await alice.until(`document.querySelector(".markdown .hl-keyword")`, "rendered memo");
+  await shot(alice, "09-dark");
+  await alice.button("Settings");
+  await alice.until(`document.querySelector(".themes")`, "settings");
+  await alice.button("System", ".themes");
+  await alice.eval(`location.hash = "#/"`);
 
   section("phone width");
   await alice.viewport(390, 780);

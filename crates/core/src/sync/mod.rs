@@ -15,9 +15,9 @@ pub use engine::{
     CopyReason, MAX_ROUNDS, Step, SyncEvent, SyncReport, SyncSession, Upload, pending_uploads, upload_done,
 };
 pub use local::{
-    NewAttachment, NewThumbnail, add_attachment, cached_attachment, create_memo, delete_memo, edit_body, edit_memo,
-    has_unsynced, memo_attachment, resolve_conflict, resolve_with_body, restore_revision, save_as_copy, set_memo_state,
-    toggle_task, verify_contact,
+    NewAttachment, NewThumbnail, add_attachment, cached_attachment, create_memo, delete_filter, delete_memo, edit_body,
+    edit_memo, has_unsynced, memo_attachment, resolve_conflict, resolve_with_body, restore_revision, save_as_copy,
+    save_filter, set_memo_state, toggle_task, verify_contact,
 };
 pub use memory::MemoryStore;
 pub use sharing::{PreparedRevoke, apply_revoke, prepare_revoke, prepare_share};
@@ -26,6 +26,6 @@ pub use store::{
     UndecodedReason, VaultRecord,
 };
 pub use view::{
-    AttachmentView, ConflictView, MemberView, MemoDetail, MemoFilter, MemoSummary, TagCount, Trust, contact_trust,
-    memo_detail, memo_list, open_revision, tag_counts,
+    AttachmentView, ConflictView, Has, MemberView, MemoDetail, MemoFilter, MemoLink, MemoSummary, SavedFilter, Stats,
+    TagCount, Trust, activity, contact_trust, memo_detail, memo_list, open_revision, saved_filters, stats, tag_counts,
 };

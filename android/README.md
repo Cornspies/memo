@@ -2,10 +2,11 @@
 
 Offline-first: every memo, key and image you open lives on the device, and sync catches up when the
 server is reachable (`docs/sync.md`). The UI is Compose Multiplatform; everything else runs in
-`memo-core`, compiled for Android (`crates/android`), with its SQLite store (`crates/sqlite`).
+`memo-core`, compiled for Android (`crates/android` over `crates/native`), with its SQLite store
+(`crates/sqlite`).
 
 - **Kotlin ↔ Rust:** one JNI function, `Native.call(request, data)`: a JSON request as UTF-8 bytes,
-  optional bytes (images, blobs), and an encoded reply (see `crates/android/src/lib.rs`).
+  optional bytes (images, blobs), and an encoded reply (see `crates/native/src/lib.rs`).
 - **Keys:** after sign-in, the device token, account key and private key are kept in a file
   encrypted with an Android Keystore key (`AccountFile.kt`). The app opens without the password.
   Signing out, or the server revoking the device, deletes the local copy.

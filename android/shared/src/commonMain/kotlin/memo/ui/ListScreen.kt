@@ -13,6 +13,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.DropdownMenu
@@ -45,16 +47,31 @@ import kotlinx.coroutines.delay
 fun ListScreen(app: AppState) {
     val version by app.backend.version.collectAsState()
     val filter = app.filter
+    val platform = app.platform
     var memos by remember { mutableStateOf<List<MemoSummary>?>(null) }
     var tags by remember { mutableStateOf<List<TagCount>>(emptyList()) }
+    var saved by remember { mutableStateOf<List<SavedFilter>>(emptyList()) }
+    var counts by remember { mutableStateOf<Map<Long, Int>>(emptyMap()) }
     var searching by remember { mutableStateOf(filter.query.isNotEmpty()) }
+    var calendar by remember { mutableStateOf(filter.day != null) }
     var menu by remember { mutableStateOf(false) }
+    var saving by remember { mutableStateOf<String?>(null) }
+    val chips = rememberLazyListState()
 
     LaunchedEffect(version, filter) {
         if (filter.query.isNotEmpty()) delay(150)
         try {
             memos = app.backend.list(filter)
             tags = app.backend.tags()
+            saved = app.backend.savedFilters()
+        } catch (e: BackendException) {
+            app.error(e)
+        }
+    }
+    LaunchedEffect(version, calendar) {
+        if (!calendar) return@LaunchedEffect
+        try {
+            counts = app.backend.activity().groupingBy { platform.dayStart(it) }.eachCount()
         } catch (e: BackendException) {
             app.error(e)
         }
@@ -65,6 +82,15 @@ fun ListScreen(app: AppState) {
             val id = app.backend.create("")
             app.go(Screen.Memo(id, startEditing = true))
         }
+
+    val current = saved.find { filter.isSaved(it) }
+    val describe =
+        listOfNotNull(
+            "Archive".takeIf { filter.archived },
+            filter.query.trim().takeIf { it.isNotEmpty() }?.let { "“$it”" },
+            filter.tag?.let { "#$it" },
+            filter.day?.let { platform.date(it) },
+        ).plus(QuickFilters.filter { it.first in filter.has }.map { it.second.lowercase() }).joinToString(" · ")
 
     Scaffold(
         topBar = {
@@ -80,11 +106,15 @@ fun ListScreen(app: AppState) {
                         searching = !searching
                         if (!searching) app.filter = filter.copy(query = "")
                     }
+                    IconAction(Icons.Calendar, "Calendar") {
+                        calendar = !calendar
+                        if (!calendar) app.filter = filter.copy(day = null)
+                    }
                     IconAction(Icons.More, "More") { menu = true }
                     DropdownMenu(menu, { menu = false }) {
                         DropdownMenuItem({ Text(if (filter.archived) "Memos" else "Archive") }, {
                             menu = false
-                            app.filter = filter.copy(archived = !filter.archived, tag = null)
+                            app.filter = MemoFilter(archived = !filter.archived)
                         })
                         DropdownMenuItem({ Text("Sync now") }, {
                             menu = false
@@ -114,6 +144,31 @@ fun ListScreen(app: AppState) {
                     modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp),
                 )
             }
+            if (calendar) {
+                MonthCalendar(platform, counts, filter.day) { day -> app.filter = filter.copy(day = day, archived = false) }
+            }
+            // Saved filters come first: show a new one.
+            LaunchedEffect(saved.size) { chips.scrollToItem(0) }
+            LazyRow(
+                state = chips,
+                contentPadding = PaddingValues(horizontal = 16.dp),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                items(saved, key = { "saved:${it.id}" }) { item ->
+                    FilterChip(
+                        selected = filter.isSaved(item),
+                        onClick = { app.filter = if (filter.isSaved(item)) MemoFilter() else item.toFilter() },
+                        label = { Text("★ ${item.name}") },
+                    )
+                }
+                items(QuickFilters, key = { "has:${it.first}" }) { (has, name) ->
+                    FilterChip(
+                        selected = has in filter.has,
+                        onClick = { app.filter = filter.copy(has = if (has in filter.has) filter.has - has else filter.has + has) },
+                        label = { Text(name) },
+                    )
+                }
+            }
             if (tags.isNotEmpty() && !filter.archived) {
                 LazyRow(
                     contentPadding = PaddingValues(horizontal = 16.dp),
@@ -128,13 +183,33 @@ fun ListScreen(app: AppState) {
                     }
                 }
             }
+            if (filter.narrowed) {
+                Row(Modifier.fillMaxWidth().padding(start = 16.dp, end = 8.dp), verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        describe,
+                        style = MaterialTheme.typography.labelLarge,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f),
+                    )
+                    if (current != null) {
+                        SmallButton("Delete") { app.run { app.backend.deleteFilter(current.id) } }
+                    } else if (!filter.archived && filter.day == null && (filter.query.isNotBlank() || filter.tag != null || filter.has.isNotEmpty())) {
+                        SmallButton("Save") { saving = filter.tag?.let { "#$it" } ?: filter.query.trim() }
+                    }
+                    SmallButton("Clear") {
+                        searching = false
+                        app.filter = MemoFilter()
+                    }
+                }
+            }
             val list = memos
             when {
                 list == null -> {}
                 list.isEmpty() ->
                     Text(
                         when {
-                            filter.query.isNotEmpty() || filter.tag != null -> "No memos match."
+                            filter.narrowed && !filter.archived -> "No memos match."
                             filter.archived -> "Nothing archived."
                             else -> "No memos yet. Tap + to write one."
                         },
@@ -146,10 +221,47 @@ fun ListScreen(app: AppState) {
                         contentPadding = PaddingValues(start = 12.dp, end = 12.dp, top = 8.dp, bottom = 96.dp),
                         verticalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
-                        items(list, key = { it.id }) { memo -> MemoCard(app, memo) }
+                        // The timeline: pinned memos, then one group per day of the last change.
+                        var group: Long? = null
+                        list.forEachIndexed { i, memo ->
+                            val key = if (memo.pinned) -1L else platform.dayStart(memo.updatedAt)
+                            if (i == 0 || key != group) {
+                                group = key
+                                item(key = "day:$key") {
+                                    Text(
+                                        if (key == -1L) "Pinned" else platform.dayLabel(key),
+                                        style = MaterialTheme.typography.labelLarge,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        modifier = Modifier.padding(start = 4.dp, top = if (i == 0) 0.dp else 8.dp),
+                                    )
+                                }
+                            }
+                            item(key = memo.id) { MemoCard(app, memo) }
+                        }
                     }
             }
         }
+    }
+
+    saving?.let { name ->
+        AlertDialog(
+            onDismissRequest = { saving = null },
+            title = { Text("Save filter") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Text(describe, style = MaterialTheme.typography.bodySmall)
+                    OutlinedTextField(name, { saving = it }, label = { Text("Name") }, singleLine = true)
+                }
+            },
+            confirmButton = {
+                TextButton({
+                    val chosen = name.trim()
+                    saving = null
+                    app.run { app.backend.saveFilter(chosen, filter) }
+                }, enabled = name.isNotBlank()) { Text("Save") }
+            },
+            dismissButton = { TextButton({ saving = null }) { Text("Cancel") } },
+        )
     }
 }
 

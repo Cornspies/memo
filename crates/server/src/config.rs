@@ -145,6 +145,22 @@ impl Config {
     pub fn secure_cookies(&self) -> bool {
         self.public_url.starts_with("https://")
     }
+
+    /// Whether a browser `Origin` is this server's: the public URL, or for a loopback public URL
+    /// any loopback name for it (`localhost`, `127.0.0.1`, `[::1]`) with the same scheme and port.
+    pub fn origin_allowed(&self, origin: &str) -> bool {
+        origin == self.public_url || loopback(origin).is_some_and(|o| Some(o) == loopback(&self.public_url))
+    }
+}
+
+/// A loopback origin with its host written as `localhost`; `None` for any other origin.
+fn loopback(origin: &str) -> Option<String> {
+    let (scheme, rest) = origin.split_once("://")?;
+    let (host, port) = match rest.find(']') {
+        Some(end) if rest.starts_with('[') => rest.split_at(end + 1),
+        _ => rest.rfind(':').map_or((rest, ""), |i| rest.split_at(i)),
+    };
+    matches!(host, "localhost" | "127.0.0.1" | "[::1]").then(|| format!("{scheme}://localhost{port}"))
 }
 
 /// A byte size: an integer, or a string like `"25MiB"`.
@@ -286,5 +302,24 @@ mod tests {
         assert_eq!(config.retention.revisions_per_memo, 0);
         assert_eq!(config.retention.tombstone_days, 90);
         assert!(toml::from_str::<Config>("typo = 1").is_err());
+    }
+
+    #[test]
+    fn origins() {
+        let config = |url: &str| Config { public_url: url.into(), ..Config::default() };
+        let public = config("https://memo.example.com");
+        assert!(public.origin_allowed("https://memo.example.com"));
+        assert!(!public.origin_allowed("http://memo.example.com"));
+        assert!(!public.origin_allowed("https://localhost"));
+        let local = config("http://127.0.0.1:8080");
+        for origin in ["http://127.0.0.1:8080", "http://localhost:8080", "http://[::1]:8080"] {
+            assert!(local.origin_allowed(origin), "{origin}");
+        }
+        for origin in
+            ["http://localhost:8081", "https://localhost:8080", "http://localhost", "http://evil.example:8080"]
+        {
+            assert!(!local.origin_allowed(origin), "{origin}");
+        }
+        assert!(config("http://localhost").origin_allowed("http://127.0.0.1"));
     }
 }

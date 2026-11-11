@@ -6,3 +6,7 @@ build/
 *.db
 *.db-*
 /data
+/desktop/gen
+# A local server's config and data (README.md, Build)
+/config.toml
+/memo-data

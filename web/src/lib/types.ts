@@ -1,6 +1,6 @@
 // The read models from `memo_core::sync::view` and the API types the UI sees, plus the `Backend`
-// the UI talks to. The browser's backend runs memo-core (WASM) in a worker; the desktop app
-// will provide the same interface over Tauri commands.
+// the UI talks to. The browser's backend runs memo-core (WASM) in a worker (`backend.ts`); the
+// desktop app's runs it natively behind Tauri IPC (`native.ts`).
 
 export type Permission = "read" | "write";
 export type UndecodedReason = "missing_key" | "undecryptable" | "newer_format";
@@ -61,12 +61,47 @@ export interface MemoDetail extends MemoSummary {
   members: MemberView[];
   attachments: AttachmentView[];
   conflict_with: { body: string; version: number; edited_at: number } | null;
+  /** Memos that link to this one. */
+  linked_from: MemoLink[];
 }
+
+export interface MemoLink {
+  id: string;
+  title: string;
+}
+
+/** The quick filters: what a memo must contain. */
+export type Has = "tasks" | "open_tasks" | "links" | "images" | "code";
 
 export interface MemoFilter {
   query?: string;
   tag?: string | null;
   archived?: boolean;
+  has?: Has[];
+  /** Created in [created_from, created_before), Unix ms. */
+  created_from?: number | null;
+  created_before?: number | null;
+}
+
+export interface SavedFilter {
+  id: string;
+  name: string;
+  query: string;
+  tag: string | null;
+  has: Has[];
+}
+
+/** Counts over the memo list (the archive only as `archived`). */
+export interface Stats {
+  memos: number;
+  archived: number;
+  words: number;
+  tags: number;
+  images: number;
+  open_tasks: number;
+  done_tasks: number;
+  shared: number;
+  since: number | null;
 }
 
 export interface TagCount {
@@ -153,14 +188,19 @@ export interface AttachedImage {
 }
 
 export interface Backend {
+  /**
+   * The desktop app: memos stay on the device and work offline, the keys are kept in the OS
+   * keyring, and signing in needs the server's address (`server` below; the browser uses its own).
+   */
+  readonly native: boolean;
   on(listener: (event: BackendEvent) => void): void;
   session(): Promise<Session>;
-  login(username: string, password: string): Promise<void>;
+  login(username: string, password: string, server?: string): Promise<void>;
   unlock(password: string): Promise<void>;
   /** Returns the recovery key to show once. The session stays pending until `confirmRegistration`. */
-  register(username: string, password: string, invite: string): Promise<string>;
+  register(username: string, password: string, invite: string, server?: string): Promise<string>;
   /** Returns the new recovery key. */
-  recover(username: string, recoveryKey: string, newPassword: string): Promise<string>;
+  recover(username: string, recoveryKey: string, newPassword: string, server?: string): Promise<string>;
   /** Starts using the account after the user confirmed the recovery key. */
   finishOnboarding(): Promise<void>;
   logout(): Promise<void>;
@@ -172,6 +212,13 @@ export interface Backend {
   poke(): void;
   list(filter: MemoFilter): Promise<MemoSummary[]>;
   tags(): Promise<TagCount[]>;
+  /** Creation times of the memos in the main list, oldest first. */
+  activity(): Promise<number[]>;
+  stats(): Promise<Stats>;
+  savedFilters(): Promise<SavedFilter[]>;
+  /** Saves the filter's query, tag and quick filters under `name`. Returns the new id. */
+  saveFilter(name: string, filter: MemoFilter): Promise<string>;
+  deleteFilter(id: string): Promise<void>;
   memo(id: string): Promise<MemoDetail>;
   render(body: string): Promise<string>;
   /** Decrypted bytes and whether they may be shown inline, or `null` if not available yet. */
@@ -208,6 +255,10 @@ export interface Backend {
   deleteAccount(password: string): Promise<void>;
   /** A ZIP of every memo as Markdown, with its images. */
   exportAll(): Promise<Uint8Array>;
+  /** Hands a file to the user. Returns where it was saved, if known. */
+  saveFile(bytes: Uint8Array, name: string, type: string): Promise<string | null>;
+  /** Opens a link from a memo outside the app (desktop only; the browser follows links itself). */
+  openLink(url: string): void;
 }
 
 /** Errors from the backend: `code` is an API error code or a memo-core error name. */

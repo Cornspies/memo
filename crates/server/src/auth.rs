@@ -96,7 +96,7 @@ impl FromRequestParts<App> for Session {
         // CSRF: a cookie is sent by the browser on its own, so require the page's own origin.
         if via_cookie && !matches!(parts.method, Method::GET | Method::HEAD) {
             let origin = parts.headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
-            if origin != Some(app.config.public_url.as_str()) {
+            if !origin.is_some_and(|o| app.config.origin_allowed(o)) {
                 return Err(ApiError::forbidden("origin not allowed"));
             }
         }

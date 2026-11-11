@@ -23,8 +23,13 @@
 
 <Card title="Unlock">
   <p class="muted">
-    Signed in as <strong>{username}</strong>. Your keys are kept in memory only, so enter your password
-    to decrypt your memos.
+    {#if backend.native}
+      Signed in as <strong>{username}</strong>. Your memos are on this device, but its keys were removed.
+      Enter your password to sign in again (this needs the server).
+    {:else}
+      Signed in as <strong>{username}</strong>. Your keys are kept in memory only, so enter your password
+      to decrypt your memos.
+    {/if}
   </p>
   <form onsubmit={submit}>
     {#if error}<p class="error">{error}</p>{/if}

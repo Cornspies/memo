@@ -1,7 +1,6 @@
-// Images before encryption (`docs/crypto.md#attachments`), in the worker: memo-core checks the
-// type and strips metadata; the canvas applies EXIF rotation, downscales, and makes thumbnails.
-
-import { clean_image } from "../wasm/memo.js";
+// Images before encryption (`docs/crypto.md#attachments`): memo-core checks the type and strips
+// metadata (`Clean`: WASM in the browser's worker, the Rust side on the desktop); the canvas applies
+// EXIF rotation, downscales, and makes thumbnails.
 
 const THUMB_SIDE = 512;
 /** Below this, the original doubles as its own thumbnail. */
@@ -18,20 +17,8 @@ export interface Prepared extends Encoded {
   thumb: Encoded | null;
 }
 
-function cleaned(bytes: Uint8Array): Encoded & { orientation: number } {
-  const image = clean_image(bytes);
-  try {
-    return {
-      mime: image.mime(),
-      width: image.width(),
-      height: image.height(),
-      orientation: image.orientation(),
-      bytes: image.bytes(),
-    };
-  } finally {
-    image.free();
-  }
-}
+/** `memo_core::image::clean_image`: the checked type, size and EXIF orientation, and the bytes without metadata. */
+export type Clean = (bytes: Uint8Array) => Promise<Encoded & { orientation: number }>;
 
 async function encode(bitmap: ImageBitmap, width: number, height: number, type: string, quality: number) {
   const canvas = new OffscreenCanvas(width, height);
@@ -53,9 +40,9 @@ function fit(width: number, height: number, side: number): [number, number] {
 }
 
 /** `maxSide` downscales larger images (`null`: keep the size). GIFs are kept as they are. */
-export async function prepareImage(file: Blob, maxSide: number | null): Promise<Prepared> {
+export async function prepareImage(file: Blob, maxSide: number | null, cleaned: Clean): Promise<Prepared> {
   const input = new Uint8Array(await file.arrayBuffer());
-  const original = cleaned(input);
+  const original = await cleaned(input);
   let image: Encoded = original;
   let bitmap: ImageBitmap | null = null;
   const decode = async () =>
@@ -70,7 +57,7 @@ export async function prepareImage(file: Blob, maxSide: number | null): Promise<
       const [width, height] = fit(decoded.width, decoded.height, maxSide ?? Infinity);
       const type = original.mime === "image/jpeg" ? "image/jpeg" : original.mime;
       const out = await encode(decoded, width, height, type, 0.9);
-      image = cleaned(out.bytes);
+      image = await cleaned(out.bytes);
     }
     let thumb: Encoded | null = null;
     if (Math.max(image.width, image.height) > THUMB_SIDE || image.bytes.length > THUMB_MIN_BYTES) {
@@ -79,7 +66,7 @@ export async function prepareImage(file: Blob, maxSide: number | null): Promise<
       let out = await encode(decoded, width, height, "image/webp", 0.8);
       // Browsers that cannot encode WebP fall back to PNG; JPEG is smaller.
       if (out.type !== "image/webp") out = await encode(decoded, width, height, "image/jpeg", 0.8);
-      thumb = cleaned(out.bytes);
+      thumb = await cleaned(out.bytes);
     }
     return { ...image, thumb };
   } finally {

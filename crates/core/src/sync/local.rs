@@ -6,7 +6,7 @@ use uuid::Uuid;
 use super::{
     ops::{self, transaction},
     store::{AttachmentRecord, MemoRecord, PushError, StateRecord, Store, UndecodedReason},
-    view::open_revision,
+    view::{FILTER_PREFIX, MemoFilter, open_revision},
 };
 use crate::{
     Error, Result,
@@ -268,6 +268,38 @@ pub fn verify_contact<S: Store>(store: &mut S, user_id: Uuid) -> Result<()> {
         }
         let mut local = vault.current().clone();
         local.contacts.get_mut(&user_id).ok_or(Error::NotPinned(user_id))?.verified = true;
+        vault.local = Some(local);
+        store.put_vault(&vault)
+    })
+}
+
+/// Saves the filter's query, tag and quick filters in the vault under `name`. Returns its id.
+pub fn save_filter<S: Store>(store: &mut S, name: &str, filter: &MemoFilter) -> Result<Uuid> {
+    let id = Uuid::now_v7();
+    let value = serde_json::json!({ "name": name.trim(), "query": filter.query, "tag": filter.tag, "has": filter.has });
+    edit_settings(store, |settings| {
+        settings.insert(format!("{FILTER_PREFIX}{id}"), value);
+    })?;
+    Ok(id)
+}
+
+pub fn delete_filter<S: Store>(store: &mut S, id: Uuid) -> Result<()> {
+    edit_settings(store, |settings| {
+        settings.remove(&format!("{FILTER_PREFIX}{id}"));
+    })
+}
+
+fn edit_settings<S: Store>(
+    store: &mut S,
+    edit: impl FnOnce(&mut serde_json::Map<String, serde_json::Value>),
+) -> Result<()> {
+    transaction(store, |store| {
+        let mut vault = store.vault()?.ok_or(Error::NotFound)?;
+        if vault.newer_format {
+            return Err(Error::ReadOnly);
+        }
+        let mut local = vault.current().clone();
+        edit(&mut local.settings);
         vault.local = Some(local);
         store.put_vault(&vault)
     })

@@ -366,6 +366,31 @@ impl Client {
         sync::tag_counts(&self.store).map(|t| json(&t)).map_err(core)
     }
 
+    /// Creation times of the memos in the main list, for the calendar.
+    pub fn activity(&self) -> JsResult<String> {
+        sync::activity(&self.store).map(|a| json(&a)).map_err(core)
+    }
+
+    /// `Stats` JSON.
+    pub fn stats(&self) -> JsResult<String> {
+        sync::stats(&self.store).map(|s| json(&s)).map_err(core)
+    }
+
+    /// `SavedFilter[]` JSON.
+    pub fn saved_filters(&self) -> JsResult<String> {
+        sync::saved_filters(&self.store).map(|f| json(&f)).map_err(core)
+    }
+
+    /// Saves the query, tag and quick filters of a `MemoFilter`. Returns the new filter's id.
+    pub fn save_filter(&mut self, name: &str, filter: &str) -> JsResult<String> {
+        let filter: MemoFilter = parse(filter)?;
+        sync::save_filter(&mut self.store, name, &filter).map(|id| id.to_string()).map_err(core)
+    }
+
+    pub fn delete_filter(&mut self, filter_id: &str) -> JsResult<()> {
+        sync::delete_filter(&mut self.store, id(filter_id)?).map_err(core)
+    }
+
     /// `MemoDetail` JSON.
     pub fn memo_detail(&self, memo_id: &str) -> JsResult<String> {
         sync::memo_detail(&self.store, self.account.user_id, id(memo_id)?).map(|d| json(&d)).map_err(core)

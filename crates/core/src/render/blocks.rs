@@ -1,12 +1,13 @@
 //! Markdown as a tree of blocks, for clients that draw memos with native widgets (Android). Same
 //! rules as [`to_html`](super::to_html): raw HTML is text, only safe links are kept, images come
 //! only from attachments, single newlines are line breaks, and tags and task boxes are marked.
+//! Links to other memos keep their `memo:<id>` URL in [`Style::link`].
 
-use pulldown_cmark::{Event, HeadingLevel, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
 use serde::Serialize;
 use uuid::Uuid;
 
-use super::{OPTIONS, is_safe_url};
+use super::{OPTIONS, Token, highlight::highlight, is_safe_url, language, memo_link};
 use crate::text::{ATTACHMENT_SCHEME, find_tags};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -27,15 +28,25 @@ pub enum Block {
         start: Option<u64>,
         items: Vec<ListItem>,
     },
-    /// Fenced and indented code, and raw HTML blocks (shown as text).
+    /// Fenced and indented code, and raw HTML blocks (shown as text). `spans` splits `text` by
+    /// [`Token`] if the block names a known language, and is empty otherwise.
     Code {
         text: String,
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        spans: Vec<CodeSpan>,
     },
     Table {
         head: Vec<Vec<Inline>>,
         rows: Vec<Vec<Vec<Inline>>>,
     },
     Rule,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct CodeSpan {
+    pub text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub token: Option<Token>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -148,7 +159,10 @@ enum Frame {
         heading: Option<u8>,
         content: Vec<Inline>,
     },
-    Code(String),
+    Code {
+        text: String,
+        language: Option<String>,
+    },
     Table {
         head: Vec<Vec<Inline>>,
         rows: Vec<Vec<Vec<Inline>>>,
@@ -199,9 +213,17 @@ impl Builder {
                 self.stack.push(Frame::Inlines { heading: Some(heading_level(level)), content: Vec::new() })
             }
             Tag::BlockQuote(_) => self.stack.push(Frame::Blocks(Vec::new())),
-            Tag::CodeBlock(_) | Tag::HtmlBlock => {
+            Tag::CodeBlock(kind) => {
                 self.in_code = true;
-                self.stack.push(Frame::Code(String::new()));
+                let language = match kind {
+                    CodeBlockKind::Fenced(info) => Some(language(&info).to_owned()).filter(|l| !l.is_empty()),
+                    CodeBlockKind::Indented => None,
+                };
+                self.stack.push(Frame::Code { text: String::new(), language });
+            }
+            Tag::HtmlBlock => {
+                self.in_code = true;
+                self.stack.push(Frame::Code { text: String::new(), language: None });
             }
             Tag::List(start) => self.stack.push(Frame::List { start, items: Vec::new() }),
             Tag::Item => self.stack.push(Frame::Item(ItemFrame::default())),
@@ -217,7 +239,7 @@ impl Builder {
             Tag::Strikethrough => self.strike += 1,
             Tag::Link { dest_url, .. } => {
                 let url = dest_url.into_string();
-                self.links.push(is_safe_url(&url).then_some(url));
+                self.links.push((is_safe_url(&url) || memo_link(&url).is_some()).then_some(url));
             }
             Tag::Image { dest_url, .. } => self.image = Some((dest_url.into_string(), String::new())),
             _ => {}
@@ -241,11 +263,17 @@ impl Builder {
             }
             TagEnd::CodeBlock | TagEnd::HtmlBlock => {
                 self.in_code = false;
-                if let Some(Frame::Code(mut text)) = self.stack.pop() {
+                if let Some(Frame::Code { mut text, language }) = self.stack.pop() {
                     if text.ends_with('\n') {
                         text.pop();
                     }
-                    self.block(Block::Code { text });
+                    let spans = language
+                        .and_then(|l| highlight(&text, &l))
+                        .map(|runs| {
+                            runs.into_iter().map(|(token, text)| CodeSpan { text: text.to_owned(), token }).collect()
+                        })
+                        .unwrap_or_default();
+                    self.block(Block::Code { text, spans });
                 }
             }
             TagEnd::List(_) => {
@@ -332,7 +360,7 @@ impl Builder {
     }
 
     fn code_text(&mut self, text: &str) {
-        if let Some(Frame::Code(code)) = self.stack.last_mut() {
+        if let Some(Frame::Code { text: code, .. }) = self.stack.last_mut() {
             code.push_str(text);
         }
     }
@@ -404,7 +432,7 @@ mod tests {
         assert_eq!(
             to_blocks("<script>alert(1)</script>\n\nhi <b onclick=x>there</b>"),
             vec![
-                Block::Code { text: "<script>alert(1)</script>".into() },
+                Block::Code { text: "<script>alert(1)</script>".into(), spans: vec![] },
                 paragraph(vec![text("hi <b onclick=x>there</b>")]),
             ]
         );
@@ -497,7 +525,7 @@ mod tests {
                         Block::Heading { level: 1, content: vec![text("inner")] },
                     ],
                 },
-                Block::Code { text: "fn main() {}".into() },
+                Block::Code { text: "fn main() {}".into(), spans: vec![] },
                 Block::Table {
                     head: vec![vec![text("a")], vec![text("b")]],
                     rows: vec![vec![vec![text("1")], vec![styled("2", Style { strike: true, ..Style::default() })]]],
@@ -505,6 +533,20 @@ mod tests {
                 Block::Rule,
             ]
         );
+    }
+
+    #[test]
+    fn memo_links_and_highlighted_code() {
+        let id = "0192f3c4-7a1b-7c2d-9e8f-0a1b2c3d4e5f";
+        let blocks = to_blocks(&format!("[Groceries](memo:{id})\n\n```py\nx = 1\n```"));
+        assert_eq!(
+            blocks[0],
+            paragraph(vec![styled("Groceries", Style { link: Some(format!("memo:{id}")), ..Style::default() })])
+        );
+        let Block::Code { text, spans } = &blocks[1] else { panic!("{blocks:?}") };
+        assert_eq!(text, "x = 1");
+        assert_eq!(spans.iter().map(|s| s.text.as_str()).collect::<String>(), "x = 1");
+        assert!(spans.iter().any(|s| s.text == "1" && s.token == Some(Token::Number)), "{spans:?}");
     }
 
     #[test]

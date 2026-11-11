@@ -35,8 +35,9 @@ private interface.
   returned once at login. The server stores only its SHA-256.
 - **Web:** cookie `memo_session` (`HttpOnly; Secure; SameSite=Strict; Path=/api`). Every request
   authenticated by cookie that is not `GET` must carry an `Origin` header equal to the configured
-  public URL. Otherwise the server answers `403 forbidden` (CSRF protection). `Secure` is left out
-  only when `public_url` is plain `http://` (local testing).
+  public URL. Otherwise the server answers `403 forbidden` (CSRF protection). When the public URL
+  is a loopback address, `localhost`, `127.0.0.1` and `[::1]` count as the same host (same scheme
+  and port). `Secure` is left out only when `public_url` is plain `http://` (local testing).
 - Every authenticated request updates the device's `last_seen_at`, at most once a minute.
 
 Usernames: 3–32 characters of `a-z 0-9 _ . -`, stored lowercase, unique.

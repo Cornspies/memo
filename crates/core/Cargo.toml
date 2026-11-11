@@ -17,6 +17,7 @@ rand_core = "0.10"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.11"
+syntect = { version = "5", default-features = false, features = ["default-syntaxes", "regex-fancy"], optional = true }
 subtle = "2"
 thiserror = "2"
 unicode-normalization = "0.1"
@@ -24,8 +25,8 @@ uuid = { version = "1", features = ["v7", "serde"] }
 zeroize = { version = "1", features = ["derive"] }
 
 [features]
-# Markdown to HTML for clients that render in a web view (web, desktop).
-render = ["dep:pulldown-cmark"]
+# Markdown to HTML (web, desktop) or blocks (Android), with code highlighting.
+render = ["dep:pulldown-cmark", "dep:syntect"]
 
 [dev-dependencies]
 rand_chacha = "0.10"

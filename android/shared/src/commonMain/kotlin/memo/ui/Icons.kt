@@ -91,6 +91,32 @@ object Icons {
         moveTo(18f, 6f)
         lineTo(6f, 18f)
     }
+    val Calendar = icon("calendar") {
+        moveTo(4f, 6f)
+        lineTo(20f, 6f)
+        lineTo(20f, 20f)
+        lineTo(4f, 20f)
+        close()
+        moveTo(4f, 10f)
+        lineTo(20f, 10f)
+        moveTo(8f, 3f)
+        lineTo(8f, 7f)
+        moveTo(16f, 3f)
+        lineTo(16f, 7f)
+    }
+    /** Two chain links. */
+    val Link = icon("link") {
+        moveTo(10f, 14f)
+        lineTo(14f, 10f)
+        moveTo(11f, 7f)
+        lineTo(13f, 5f)
+        arcTo(3.5f, 3.5f, 0f, false, true, 19f, 11f)
+        lineTo(17f, 13f)
+        moveTo(13f, 17f)
+        lineTo(11f, 19f)
+        arcTo(3.5f, 3.5f, 0f, false, true, 5f, 13f)
+        lineTo(7f, 11f)
+    }
 }
 
 @Composable

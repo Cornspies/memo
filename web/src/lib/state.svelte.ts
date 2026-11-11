@@ -1,10 +1,14 @@
 // App-wide state: the session, sync status, notifications, the list filter and the route.
 
 import { webBackend } from "./backend";
-import type { Backend, Session, SyncEvent, SyncStatus } from "./types";
+import { nativeBackend, nativeTransport } from "./native";
+import { nextDay } from "./format";
+import type { Backend, Has, MemoFilter, SavedFilter, Session, SyncEvent, SyncStatus } from "./types";
 import { BackendError } from "./types";
 
-export const backend: Backend = webBackend();
+/** The desktop app's (in its window, or `?ipc=http` against `memo-desktop --serve`), else the browser's. */
+const transport = nativeTransport();
+export const backend: Backend = transport ? nativeBackend(transport) : webBackend();
 
 export interface Toast {
   id: number;
@@ -21,7 +25,60 @@ export const app = $state({
   toasts: [] as Toast[],
 });
 
-export const filter = $state({ query: "", tag: null as string | null, archived: false });
+export const filter = $state({
+  query: "",
+  tag: null as string | null,
+  archived: false,
+  has: [] as Has[],
+  /** A day picked in the calendar (local midnight, Unix ms). */
+  day: null as number | null,
+});
+
+export const QUICK_FILTERS: [Has, string][] = [
+  ["open_tasks", "Open tasks"],
+  ["tasks", "Tasks"],
+  ["links", "Links"],
+  ["images", "Images"],
+  ["code", "Code"],
+];
+
+/** The list filter as the backend takes it. */
+export function listFilter(): MemoFilter {
+  return {
+    query: filter.query,
+    tag: filter.tag,
+    archived: filter.archived,
+    has: [...filter.has],
+    created_from: filter.day,
+    created_before: filter.day === null ? null : nextDay(filter.day),
+  };
+}
+
+/** Back to the whole list (the search stays). */
+export function clearFilter(archived = false) {
+  filter.archived = archived;
+  filter.tag = null;
+  filter.has = [];
+  filter.day = null;
+}
+
+export function applySaved(saved: SavedFilter) {
+  clearFilter();
+  filter.query = saved.query;
+  filter.tag = saved.tag;
+  filter.has = [...saved.has];
+}
+
+export function isSaved(saved: SavedFilter): boolean {
+  return (
+    !filter.archived &&
+    filter.day === null &&
+    filter.query.trim() === saved.query.trim() &&
+    filter.tag === saved.tag &&
+    filter.has.length === saved.has.length &&
+    saved.has.every((h) => filter.has.includes(h))
+  );
+}
 
 /** `#/memo/<id>` or `#/settings`; anything else is the list. */
 export const route = $state({ memo: null as string | null, settings: false });
@@ -124,11 +181,13 @@ document.addEventListener("visibilitychange", () => {
 });
 window.addEventListener("focus", () => backend.poke());
 window.addEventListener("beforeunload", (event) => {
-  if (app.sync.unsynced) event.preventDefault();
+  // The desktop app keeps unsynced changes on disk.
+  if (app.sync.unsynced && !backend.native) event.preventDefault();
 });
 
 const MESSAGES: Record<string, string> = {
   network: "The server cannot be reached.",
+  bad_url: "This is not a server address.",
   invalid_credentials: "Wrong username or password.",
   invite_invalid: "This invite code is unknown, expired or already used.",
   rate_limited: "Too many attempts. Wait a little and try again.",

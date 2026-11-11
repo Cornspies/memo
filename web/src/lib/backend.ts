@@ -1,5 +1,6 @@
 // The browser's `Backend`: a proxy that forwards each call to the worker.
 
+import { download } from "./format";
 import type { Backend, BackendEvent } from "./types";
 import { BackendError } from "./types";
 
@@ -31,9 +32,19 @@ export function webBackend(): Backend {
         worker.postMessage({ id, method, args });
       });
 
+  const local: Partial<Backend> = {
+    native: false,
+    on: (listener) => void listeners.push(listener),
+    saveFile: async (bytes, name, type) => {
+      download(bytes, name, type);
+      return null;
+    },
+    openLink: (url) => void window.open(url, "_blank", "noopener,noreferrer"),
+  };
+
   return new Proxy({} as Backend, {
     get(_, name) {
-      if (name === "on") return (listener: (event: BackendEvent) => void) => listeners.push(listener);
+      if (name in local) return local[name as keyof Backend];
       // Not a thenable.
       if (typeof name !== "string" || name === "then") return undefined;
       return invoke(name);

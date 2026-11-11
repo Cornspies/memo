@@ -15,6 +15,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.Checkbox
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -86,6 +87,18 @@ fun SettingsScreen(app: AppState, session: Session.Unlocked) {
     var deletePassword by remember { mutableStateOf("") }
     var deleteBusy by remember { mutableStateOf(false) }
     var deleteError by remember { mutableStateOf<String?>(null) }
+    var stats by remember { mutableStateOf<Stats?>(null) }
+    var days by remember { mutableStateOf(0) }
+    val version by app.backend.version.collectAsState()
+
+    LaunchedEffect(version) {
+        try {
+            stats = app.backend.stats()
+            days = app.backend.activity().map { app.platform.dayStart(it) }.toSet().size
+        } catch (e: BackendException) {
+            app.error(e)
+        }
+    }
 
     suspend fun load() {
         try {
@@ -115,6 +128,47 @@ fun SettingsScreen(app: AppState, session: Session.Unlocked) {
                     (me?.let { ", since ${app.platform.dateTime(it.createdAt)}." } ?: "."),
             )
             me?.let { Muted("Storage: ${size(it.usedBytes)} of ${size(it.quotaBytes)} used.") }
+
+            Section("Appearance")
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                for ((value, label) in listOf("system" to "System", "light" to "Light", "dark" to "Dark")) {
+                    FilterChip(
+                        selected = app.theme == value,
+                        onClick = {
+                            app.theme = value
+                            app.backend.theme = value
+                        },
+                        label = { Text(label) },
+                    )
+                }
+            }
+            Muted("On this device. System follows the phone's setting.")
+
+            stats?.let { s ->
+                Section("Statistics")
+                val rows =
+                    listOf(
+                        "Memos" to "${s.memos}",
+                        "Days with memos" to "$days",
+                        "Words" to "${s.words}",
+                        "Tags" to "${s.tags}",
+                        "Images" to "${s.images}",
+                        "Tasks done" to "${s.doneTasks} of ${s.doneTasks + s.openTasks}",
+                        "Shared" to "${s.shared}",
+                        "Archived" to "${s.archived}",
+                    )
+                for (pair in rows.chunked(2)) {
+                    Row {
+                        for ((label, value) in pair) {
+                            Column(Modifier.weight(1f)) {
+                                Muted(label)
+                                Text(value, style = MaterialTheme.typography.titleLarge)
+                            }
+                        }
+                    }
+                }
+                s.since?.let { Muted("The oldest memo in the list is from ${app.platform.date(it)}.") }
+            }
 
             Section("Your key fingerprint")
             Muted("People you share with can compare this with what their app shows for you, to be sure nobody is in between.")

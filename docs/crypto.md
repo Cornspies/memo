@@ -212,6 +212,9 @@ to update instead.
   whitespace or `(`. Tags inside code spans and fenced code blocks do not count. They compare
   lowercased. `memo_core::text` implements this, so every client agrees.
 - Images are referenced as `attachment:<id>` URLs. `thumb` is `null` if no thumbnail exists.
+- Links to other memos are `memo:<id>` URLs: `[Groceries](memo:0192f3c4-…)` or `<memo:0192f3c4-…>`.
+  They open only for members of the target memo. Clients list a memo's backlinks (the memos linking
+  to it) from what they can decrypt; the server never sees links.
 - `edited_at` is the client's clock when the edit was made. It is for display only.
 
 ### Vault payload
@@ -225,6 +228,12 @@ to update instead.
   "settings": {}
 }
 ```
+
+- `settings` keys starting with `filter/` are saved filters, one key per filter (`filter/<uuid>`), so
+  two devices can add filters at the same time:
+  `{"name": "Open work", "query": "", "tag": "work", "has": ["open_tasks"]}`. `has` lists what a memo
+  must contain: `tasks`, `open_tasks`, `links` (web or memo links), `images` or `code`. Clients skip
+  filters they cannot parse.
 
 ## Attachments
 
@@ -275,6 +284,8 @@ blocks inline scripts as a second line of defence; Android never uses a web view
 **Unlock without a password (native):** after a login, the device token, `account_key` and private key
 are stored in the OS keystore (Android Keystore-wrapped storage; on Linux the Secret Service via the
 `keyring` crate). If no keystore is available, the client asks for the password at every start.
+On the desktop, *Lock* signs the device out and deletes the stored keys and token; the local database
+stays, and unlocking is a new login (online) that reopens it. Only signing out deletes it.
 
 **Web session:** keys live in memory only. An optional "keep unlocked in this browser" setting (off by
 default) wraps `account_key` with a non-extractable WebCrypto AES-GCM key kept in IndexedDB.

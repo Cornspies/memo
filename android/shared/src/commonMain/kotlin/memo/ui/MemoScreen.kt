@@ -1,5 +1,6 @@
 package memo.ui
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -136,6 +137,15 @@ private class Editor(val app: AppState, val id: String) {
         val body = before + prefix + snippet + value.text.substring(value.selection.max)
         changed(TextFieldValue(body, TextRange(start + prefix.length + snippet.length)))
     }
+
+    /** Inserts a link to `target` at the cursor, as `[title](memo:<id>)`. */
+    fun link(target: MemoSummary) {
+        val label = target.title.ifEmpty { "Untitled" }.replace(Regex("[\\\\\\[\\]]")) { "\\${it.value}" }
+        val snippet = "[$label](memo:${target.id})"
+        val value = text
+        val body = value.text.substring(0, value.selection.min) + snippet + value.text.substring(value.selection.max)
+        changed(TextFieldValue(body, TextRange(value.selection.min + snippet.length)))
+    }
 }
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -186,6 +196,7 @@ fun MemoScreen(app: AppState, id: String, startEditing: Boolean) {
                 actions = {
                     if (editor.editing) {
                         IconAction(Icons.Image, "Add image", enabled = !attaching) { attach() }
+                        IconAction(Icons.Link, "Link memo") { dialog = "link" }
                         IconAction(Icons.Check, "Done") { scope.launch { editor.finish(stay = true) } }
                     } else if (writable) {
                         IconAction(Icons.Edit, "Edit") { editor.startEditing() }
@@ -232,6 +243,17 @@ fun MemoScreen(app: AppState, id: String, startEditing: Boolean) {
                             }
                             Markdown(RenderContext(app, id, memo.attachments, toggle), memo.body)
                         }
+                        if (memo.linkedFrom.isNotEmpty()) {
+                            HorizontalDivider()
+                            Text("Linked from", style = MaterialTheme.typography.labelLarge)
+                            for (from in memo.linkedFrom) {
+                                Text(
+                                    from.title.ifEmpty { "Untitled" },
+                                    color = MaterialTheme.colorScheme.primary,
+                                    modifier = Modifier.fillMaxWidth().clickable { app.go(Screen.Memo(from.id)) }.padding(vertical = 4.dp),
+                                )
+                            }
+                        }
                         HorizontalDivider()
                         Footer(app, memo)
                     }
@@ -240,6 +262,11 @@ fun MemoScreen(app: AppState, id: String, startEditing: Boolean) {
     }
 
     when (dialog) {
+        "link" ->
+            LinkDialog(app, id, { dialog = null }) { target ->
+                dialog = null
+                editor.link(target)
+            }
         "share" -> if (memo != null) ShareDialog(app, memo) { dialog = null }
         "history" -> if (memo != null) HistoryDialog(app, memo) { dialog = null }
         "delete" ->
@@ -317,6 +344,34 @@ private fun MemoMenu(app: AppState, memo: MemoDetail, open: Boolean, onDismiss: 
                 onDismiss()
                 onDialog("leave")
             })
+        }
+    }
+}
+
+/** Picks a memo to link to: search by text, archived memos included. */
+@Composable
+private fun LinkDialog(app: AppState, exclude: String, onClose: () -> Unit, onPick: (MemoSummary) -> Unit) {
+    var query by remember { mutableStateOf("") }
+    var results by remember { mutableStateOf<List<MemoSummary>>(emptyList()) }
+    LaunchedEffect(query) {
+        delay(150)
+        try {
+            results =
+                (app.backend.list(MemoFilter(query = query)) + app.backend.list(MemoFilter(query = query, archived = true)))
+                    .filter { it.id != exclude }.take(50)
+        } catch (e: BackendException) {
+            app.error(e)
+        }
+    }
+    Sheet("Link to a memo", onClose) {
+        OutlinedTextField(query, { query = it }, placeholder = { Text("Search") }, singleLine = true, modifier = Modifier.fillMaxWidth())
+        if (results.isEmpty()) Text("Nothing matches.", color = MaterialTheme.colorScheme.onSurfaceVariant)
+        for (memo in results) {
+            Text(
+                memo.title.ifEmpty { "Untitled" } + if (memo.archived) " · archived" else "",
+                maxLines = 1,
+                modifier = Modifier.fillMaxWidth().clickable { onPick(memo) }.padding(vertical = 8.dp),
+            )
         }
     }
 }

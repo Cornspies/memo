@@ -1,7 +1,8 @@
 <script lang="ts">
-  import { dateTime, download, size, when } from "../lib/format";
+  import { dateTime, dayStart, size, when } from "../lib/format";
   import { app, backend, errorText, go, toast } from "../lib/state.svelte";
-  import type { Device, Me } from "../lib/types";
+  import { setTheme, theme, type Theme } from "../lib/theme";
+  import type { Device, Me, Stats } from "../lib/types";
 
   let me = $state<Me | null>(null);
   let devices = $state<Device[] | null>(null);
@@ -19,6 +20,23 @@
   let deleteBusy = $state(false);
   let deleteError = $state<string | null>(null);
   let exporting = $state(false);
+
+  let appearance = $state<Theme>(theme());
+  const THEMES: [Theme, string][] = [
+    ["system", "System"],
+    ["light", "Light"],
+    ["dark", "Dark"],
+  ];
+
+  let stats = $state<Stats | null>(null);
+  /** Days with at least one memo, in this time zone. */
+  let days = $state(0);
+
+  $effect(() => {
+    void app.version;
+    backend.stats().then((s) => (stats = s));
+    backend.activity().then((times) => (days = new Set(times.map(dayStart)).size));
+  });
 
   const fingerprint = $derived(app.session?.state === "unlocked" ? app.session.fingerprint : "");
 
@@ -64,7 +82,9 @@
     exporting = true;
     try {
       const zip = await backend.exportAll();
-      download(zip, `memo-export-${new Date().toISOString().slice(0, 10)}.zip`, "application/zip");
+      const name = `memo-export-${new Date().toISOString().slice(0, 10)}.zip`;
+      const path = await backend.saveFile(zip, name, "application/zip");
+      if (path) toast("info", `Saved to ${path}`);
     } catch (e) {
       toast("danger", errorText(e));
     } finally {
@@ -110,6 +130,38 @@
     </section>
   {/if}
 
+  <section>
+    <h3>Appearance</h3>
+    <div class="themes" role="radiogroup" aria-label="Theme">
+      {#each THEMES as [value, label] (value)}
+        <button
+          role="radio"
+          aria-checked={appearance === value}
+          class:on={appearance === value}
+          onclick={() => setTheme((appearance = value))}>{label}</button
+        >
+      {/each}
+    </div>
+    <p class="muted small-text">On this device. System follows your operating system's setting.</p>
+  </section>
+  {#if stats}
+    <section>
+      <h3>Statistics</h3>
+      <dl class="stats">
+        <div><dt>Memos</dt><dd>{stats.memos}</dd></div>
+        <div><dt>Days with memos</dt><dd>{days}</dd></div>
+        <div><dt>Words</dt><dd>{stats.words.toLocaleString()}</dd></div>
+        <div><dt>Tags</dt><dd>{stats.tags}</dd></div>
+        <div><dt>Images</dt><dd>{stats.images}</dd></div>
+        <div><dt>Tasks done</dt><dd>{stats.done_tasks} of {stats.done_tasks + stats.open_tasks}</dd></div>
+        <div><dt>Shared</dt><dd>{stats.shared}</dd></div>
+        <div><dt>Archived</dt><dd>{stats.archived}</dd></div>
+      </dl>
+      {#if stats.since !== null}
+        <p class="muted small-text">The oldest memo in the list is from {dateTime(stats.since)}.</p>
+      {/if}
+    </section>
+  {/if}
   <section>
     <h3>Your key fingerprint</h3>
     <p class="muted small-text">
@@ -179,8 +231,16 @@
       <button onclick={() => backend.lock()}>Lock</button>
       <button onclick={() => backend.logout()}>Sign out</button>
     </div>
+    {#if backend.native}
+      <p class="muted small-text">
+        Lock removes the keys from this device and keeps your memos on it; unlocking needs the password and
+        the server. Sign out also deletes the memos from this device.
+      </p>
+    {/if}
     {#if app.sync.unsynced}
-      <p class="notice warning small-text">Some changes are not synced yet. They are lost if you lock or sign out now.</p>
+      <p class="notice warning small-text">
+        Some changes are not synced yet. They are lost if you {backend.native ? "sign out" : "lock or sign out"} now.
+      </p>
     {/if}
   </section>
 
@@ -220,6 +280,37 @@
   }
   .back {
     display: none;
+  }
+  .themes {
+    display: inline-flex;
+    gap: 4px;
+    margin-bottom: 6px;
+  }
+  .themes .on {
+    background: var(--accent-soft);
+    border-color: var(--accent);
+    color: var(--accent);
+    font-weight: 600;
+  }
+  .stats {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(130px, 1fr));
+    gap: 10px;
+    margin: 0 0 8px;
+  }
+  .stats div {
+    background: var(--surface-2);
+    border-radius: var(--radius);
+    padding: 8px 12px;
+  }
+  .stats dt {
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .stats dd {
+    margin: 0;
+    font-size: 20px;
+    font-weight: 600;
   }
   section {
     padding: 18px 0;

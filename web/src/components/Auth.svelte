@@ -11,6 +11,16 @@
   let confirm = $state("");
   let invite = $state(location.hash.startsWith("#/invite/") ? decodeURIComponent(location.hash.slice(9)) : "");
   let recoveryKey = $state("");
+  /** The desktop app asks which server; the browser uses the one it was loaded from. */
+  let server = $state(readServer());
+
+  function readServer() {
+    try {
+      return localStorage.getItem("memo-server") ?? "";
+    } catch {
+      return "";
+    }
+  }
   let busy = $state(false);
   let error = $state<string | null>(null);
 
@@ -35,13 +45,19 @@
       if (password !== confirm) return (error = "The passwords do not match.");
     }
     busy = true;
+    const address = backend.native ? server : undefined;
     try {
       if (mode === "login") {
-        await backend.login(username, password);
+        await backend.login(username, password, address);
       } else if (mode === "register") {
-        onrecoverykey(await backend.register(username, password, invite));
+        onrecoverykey(await backend.register(username, password, invite, address));
       } else {
-        onrecoverykey(await backend.recover(username, recoveryKey, password));
+        onrecoverykey(await backend.recover(username, recoveryKey, password, address));
+      }
+      try {
+        if (address) localStorage.setItem("memo-server", address.trim());
+      } catch {
+        // Only a convenience.
       }
     } catch (e) {
       error = errorText(e, {
@@ -58,6 +74,20 @@
 <Card title={titles[mode]}>
   <form onsubmit={submit}>
     {#if error}<p class="error">{error}</p>{/if}
+    {#if backend.native}
+      <label class="field">
+        <span>Server</span>
+        <input
+          type="text"
+          bind:value={server}
+          required
+          placeholder="memo.example.org"
+          autocomplete="url"
+          autocapitalize="none"
+          spellcheck="false"
+        />
+      </label>
+    {/if}
     {#if mode === "register"}
       <label class="field">
         <span>Invite code</span>

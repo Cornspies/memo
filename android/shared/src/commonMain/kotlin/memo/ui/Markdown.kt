@@ -42,6 +42,7 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.ImageBitmap
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.LinkAnnotation
@@ -131,7 +132,7 @@ private fun Block(ctx: RenderContext, block: Block) {
             }
         is Block.Code ->
             Text(
-                block.text,
+                highlighted(block),
                 style = type.bodyMedium.copy(fontFamily = FontFamily.Monospace),
                 modifier =
                     Modifier.fillMaxWidth().clip(RoundedCornerShape(6.dp))
@@ -194,7 +195,12 @@ private fun annotated(ctx: RenderContext, run: List<Inline>): AnnotatedString {
                             background = if (inline.code) colors.surfaceContainerHigh else Color.Unspecified,
                         )
                     val link = inline.link
-                    if (link != null) {
+                    if (link != null && link.startsWith("memo:")) {
+                        val target = link.removePrefix("memo:")
+                        withLink(LinkAnnotation.Clickable(link, linkStyle) { ctx.app.go(Screen.Memo(target)) }) {
+                            withStyle(span) { append(inline.text) }
+                        }
+                    } else if (link != null) {
                         withLink(LinkAnnotation.Url(link, linkStyle)) { withStyle(span) { append(inline.text) } }
                     } else {
                         withStyle(span) { append(inline.text) }
@@ -210,6 +216,29 @@ private fun annotated(ctx: RenderContext, run: List<Inline>): AnnotatedString {
                 Inline.Break -> append("\n")
                 is Inline.Image -> {}
             }
+        }
+    }
+}
+
+/** Code with its highlight tokens coloured, in the web app's palette (web/src/app.css). */
+@Composable
+private fun highlighted(block: Block.Code): AnnotatedString {
+    if (block.spans.isEmpty()) return AnnotatedString(block.text)
+    val dark = MaterialTheme.colorScheme.background.luminance() < 0.5f
+    fun color(light: Long, night: Long) = Color(if (dark) night else light)
+    return buildAnnotatedString {
+        for (span in block.spans) {
+            val style =
+                when (span.token) {
+                    "comment" -> SpanStyle(color = color(0xFF6B716D, 0xFF868E89), fontStyle = FontStyle.Italic)
+                    "string" -> SpanStyle(color = color(0xFF2F7A3B, 0xFF9FD39A))
+                    "number", "constant" -> SpanStyle(color = color(0xFFA3501F, 0xFFF0A878))
+                    "keyword" -> SpanStyle(color = color(0xFF7A3E9D, 0xFFCFA2EE))
+                    "function" -> SpanStyle(color = color(0xFF245F9E, 0xFF8CC0F2))
+                    "type" -> SpanStyle(color = color(0xFF8A5A00, 0xFFF0C878))
+                    else -> null
+                }
+            if (style != null) withStyle(style) { append(span.text) } else append(span.text)
         }
     }
 }

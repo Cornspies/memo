@@ -1,5 +1,5 @@
-//! Plain-text views of a memo body: title, preview, tags and image references. Every client
-//! uses these, so lists and tag filters look the same everywhere.
+//! Plain-text views of a memo body: title, preview, tags, what it contains, and references to
+//! images and other memos. Every client uses these, so lists and filters look the same everywhere.
 
 use std::collections::BTreeSet;
 
@@ -10,6 +10,7 @@ use crate::payload::MemoPayload;
 const TITLE_CHARS: usize = 100;
 const PREVIEW_CHARS: usize = 200;
 pub(crate) const ATTACHMENT_SCHEME: &str = "attachment:";
+pub(crate) const MEMO_SCHEME: &str = "memo:";
 
 /// The first line with text, without Markdown markers.
 pub fn title(body: &str) -> String {
@@ -37,6 +38,7 @@ fn content_lines(body: &str) -> impl Iterator<Item = String> + '_ {
         if let Some(open) = fence {
             if Fence::parse(line).is_some_and(|close| close.closes(open)) {
                 fence = None;
+                return None;
             }
             return Some(line.trim().to_owned()).filter(|l| !l.is_empty());
         }
@@ -230,6 +232,91 @@ pub fn referenced_attachments(body: &str) -> BTreeSet<Uuid> {
         .collect()
 }
 
+/// Memos the body links to: `memo:<id>` as a link target, `(memo:<id>)` or `<memo:<id>>`.
+pub fn linked_memos(body: &str) -> BTreeSet<Uuid> {
+    body.match_indices(MEMO_SCHEME)
+        .filter(|&(i, _)| body[..i].ends_with(['(', '<']))
+        .filter_map(|(i, _)| body.get(i + MEMO_SCHEME.len()..i + MEMO_SCHEME.len() + 36))
+        .filter_map(|id| Uuid::try_parse(id).ok())
+        .collect()
+}
+
+/// What a body contains, for the quick filters and the statistics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Contents {
+    pub open_tasks: usize,
+    pub done_tasks: usize,
+    /// A web or `mailto:` address, or a link to a memo, outside code.
+    pub links: bool,
+    /// A fenced code block or a code span.
+    pub code: bool,
+    /// Whitespace-separated words with at least one letter or digit.
+    pub words: usize,
+}
+
+pub fn contents(body: &str) -> Contents {
+    let mut contents = Contents {
+        words: body.split_whitespace().filter(|w| w.chars().any(char::is_alphanumeric)).count(),
+        ..Contents::default()
+    };
+    let mut fence: Option<Fence> = None;
+    for line in body.lines() {
+        if let Some(open) = fence {
+            if Fence::parse(line).is_some_and(|close| close.closes(open)) {
+                fence = None;
+            }
+            continue;
+        }
+        if let Some(open) = Fence::parse(line) {
+            fence = Some(open);
+            contents.code = true;
+            continue;
+        }
+        match task_box(line) {
+            Some(true) => contents.done_tasks += 1,
+            Some(false) => contents.open_tasks += 1,
+            None => {}
+        }
+        let parts = outside_code_spans(line);
+        contents.code |= parts.len() > 1;
+        contents.links |= parts.iter().any(|part| has_link(part));
+    }
+    contents
+}
+
+/// Whether the line is a task list item, and if so whether it is checked.
+fn task_box(line: &str) -> Option<bool> {
+    let mut rest = line.trim_start();
+    while let Some(r) = rest.strip_prefix('>') {
+        rest = r.trim_start();
+    }
+    let after = match rest.strip_prefix(['-', '*', '+']) {
+        Some(r) => r,
+        None => {
+            let digits = rest.chars().take_while(char::is_ascii_digit).count();
+            if !(1..=9).contains(&digits) {
+                return None;
+            }
+            rest[digits..].strip_prefix(['.', ')'])?
+        }
+    };
+    if !after.starts_with([' ', '\t']) {
+        return None;
+    }
+    let after = after.trim_start();
+    let checked = match after.get(..3)? {
+        "[ ]" => false,
+        "[x]" | "[X]" => true,
+        _ => return None,
+    };
+    after[3..].starts_with([' ', '\t']).then_some(checked)
+}
+
+fn has_link(text: &str) -> bool {
+    let lower = text.to_ascii_lowercase();
+    ["http://", "https://", "mailto:"].iter().any(|scheme| lower.contains(scheme)) || !linked_memos(text).is_empty()
+}
+
 /// Flips the task box (`[ ]` or `[x]`) at byte `offset`, as `memo_core::render` reports it. `None`
 /// if there is no box there (the body changed since it was rendered).
 pub fn toggle_task(body: &str, offset: usize) -> Option<String> {
@@ -266,6 +353,7 @@ mod tests {
         assert_eq!(title(""), "");
         assert_eq!(title(&"x".repeat(150)).chars().count(), TITLE_CHARS + 1);
         assert_eq!(title("```\ncode line\n```"), "code line");
+        assert_eq!(preview("# T\n```\ncode\n```\nafter"), "code after");
     }
 
     #[test]
@@ -276,6 +364,24 @@ mod tests {
         assert_eq!(tags("#日本 #Über"), ["über", "日本"]);
         assert_eq!(find_tags("x#y #z", false), vec![std::ops::Range { start: 4, end: 6 }]);
         assert_eq!(find_tags("#z", false), Vec::<std::ops::Range<usize>>::new());
+    }
+
+    #[test]
+    fn contents_and_links() {
+        let id: Uuid = "0192f3c4-7a1b-7c2d-9e8f-0a1b2c3d4e5f".parse().unwrap();
+        let body = format!(
+            "# Plan\n- [ ] one\n* [x] two\n> 1. [X] three\n-[ ] not a task\n- [ ]\n\
+             see [it](memo:{id}) and <memo:{id}>, not xmemo:{id}\n```\n- [ ] in code https://x.org\n```"
+        );
+        let c = contents(&body);
+        assert_eq!((c.open_tasks, c.done_tasks), (1, 2));
+        assert!(c.links && c.code);
+        assert_eq!(linked_memos(&body), BTreeSet::from([id]));
+        assert!(contents("plain `x` text").code);
+        assert!(!contents("plain text, no link").links);
+        assert!(!contents("`https://x.org` in code").links);
+        assert!(contents("Mail MAILTO:a@b.org").links);
+        assert_eq!(contents("# A - title, 2 words\n- [ ] x").words, 5);
     }
 
     #[test]

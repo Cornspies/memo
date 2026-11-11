@@ -26,6 +26,78 @@ pub struct MemoFilter {
     /// The archive instead of the main list.
     #[serde(default)]
     pub archived: bool,
+    /// What the memo must all contain.
+    #[serde(default)]
+    pub has: Vec<Has>,
+    /// Created at or after this time (Unix ms). Clients pass the bounds of a local day.
+    #[serde(default)]
+    pub created_from: Option<i64>,
+    /// Created before this time (Unix ms).
+    #[serde(default)]
+    pub created_before: Option<i64>,
+}
+
+/// The quick filters (`docs/crypto.md#vault-payload`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Has {
+    Tasks,
+    OpenTasks,
+    Links,
+    Images,
+    Code,
+}
+
+impl Has {
+    fn matches(self, contents: &text::Contents, images: usize) -> bool {
+        match self {
+            Has::Tasks => contents.open_tasks + contents.done_tasks > 0,
+            Has::OpenTasks => contents.open_tasks > 0,
+            Has::Links => contents.links,
+            Has::Images => images > 0,
+            Has::Code => contents.code,
+        }
+    }
+}
+
+/// A saved filter from the vault: a name for a search, a tag and quick filters.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SavedFilter {
+    #[serde(skip_deserializing)]
+    pub id: Uuid,
+    pub name: String,
+    #[serde(default)]
+    pub query: String,
+    #[serde(default)]
+    pub tag: Option<String>,
+    #[serde(default)]
+    pub has: Vec<Has>,
+}
+
+pub(crate) const FILTER_PREFIX: &str = "filter/";
+
+/// Counts over the memo list (the archive only as `archived`). Clients count the days with memos
+/// from [`activity`], in their time zone.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct Stats {
+    pub memos: usize,
+    pub archived: usize,
+    pub words: usize,
+    pub tags: usize,
+    pub images: usize,
+    pub open_tasks: usize,
+    pub done_tasks: usize,
+    /// Shared with someone, by the user or with the user.
+    pub shared: usize,
+    /// Creation time of the oldest memo.
+    pub since: Option<i64>,
+}
+
+/// Another memo, as a link to it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct MemoLink {
+    pub id: Uuid,
+    pub title: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -64,6 +136,8 @@ pub struct MemoDetail {
     /// The body's images, and during a conflict also those of the other version.
     pub attachments: Vec<AttachmentView>,
     pub conflict_with: Option<ConflictView>,
+    /// Memos that link to this one, by title.
+    pub linked_from: Vec<MemoLink>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
@@ -119,15 +193,24 @@ pub fn memo_list<S: Store>(store: &S, filter: &MemoFilter) -> Result<Vec<MemoSum
     let terms: Vec<String> = filter.query.split_whitespace().map(str::to_lowercase).collect();
     let tag = filter.tag.as_deref().map(str::to_lowercase);
     let mut list = Vec::new();
-    for id in store.memo_ids()? {
-        let Some(memo) = store.memo(id)?.filter(|m| !m.pending_delete) else { continue };
-        let summary = summarize(store, &memo)?;
-        if summary.archived != filter.archived || tag.as_ref().is_some_and(|t| !summary.tags.contains(t)) {
+    for (memo, summary) in memos(store)? {
+        if summary.archived != filter.archived
+            || tag.as_ref().is_some_and(|t| !summary.tags.contains(t))
+            || filter.created_from.is_some_and(|from| summary.created_at < from)
+            || filter.created_before.is_some_and(|before| summary.created_at >= before)
+        {
             continue;
         }
+        let body = shown(&memo).map_or("", |p| p.body.as_str());
         if !terms.is_empty() {
-            let body = shown(&memo).map(|p| p.body.to_lowercase()).unwrap_or_default();
+            let body = body.to_lowercase();
             if !terms.iter().all(|t| body.contains(t.as_str())) {
+                continue;
+            }
+        }
+        if !filter.has.is_empty() {
+            let contents = text::contents(body);
+            if !filter.has.iter().all(|has| has.matches(&contents, summary.images)) {
                 continue;
             }
         }
@@ -135,6 +218,65 @@ pub fn memo_list<S: Store>(store: &S, filter: &MemoFilter) -> Result<Vec<MemoSum
     }
     list.sort_by(|a, b| b.pinned.cmp(&a.pinned).then(b.updated_at.cmp(&a.updated_at)).then(b.id.cmp(&a.id)));
     Ok(list)
+}
+
+/// Every memo the UI can show, with its summary.
+fn memos<S: Store>(store: &S) -> Result<Vec<(MemoRecord, MemoSummary)>> {
+    let mut memos = Vec::new();
+    for id in store.memo_ids()? {
+        if let Some(memo) = store.memo(id)?.filter(|m| !m.pending_delete) {
+            let summary = summarize(store, &memo)?;
+            memos.push((memo, summary));
+        }
+    }
+    Ok(memos)
+}
+
+/// When the memos in the main list (not archived) were created, oldest first, for a calendar.
+pub fn activity<S: Store>(store: &S) -> Result<Vec<i64>> {
+    let mut times: Vec<i64> =
+        memos(store)?.into_iter().filter(|(_, s)| !s.archived).map(|(_, s)| s.created_at).collect();
+    times.sort_unstable();
+    Ok(times)
+}
+
+pub fn stats<S: Store>(store: &S) -> Result<Stats> {
+    let mut stats = Stats::default();
+    let mut tags = std::collections::BTreeSet::new();
+    for (memo, summary) in memos(store)? {
+        if summary.archived {
+            stats.archived += 1;
+            continue;
+        }
+        let contents = text::contents(shown(&memo).map_or("", |p| p.body.as_str()));
+        stats.memos += 1;
+        stats.words += contents.words;
+        stats.images += summary.images;
+        stats.open_tasks += contents.open_tasks;
+        stats.done_tasks += contents.done_tasks;
+        stats.shared += usize::from(summary.shared);
+        stats.since = Some(stats.since.map_or(summary.created_at, |s| s.min(summary.created_at)));
+        tags.extend(summary.tags);
+    }
+    stats.tags = tags.len();
+    Ok(stats)
+}
+
+/// The saved filters from the vault, by name.
+pub fn saved_filters<S: Store>(store: &S) -> Result<Vec<SavedFilter>> {
+    let Some(vault) = store.vault()? else { return Ok(Vec::new()) };
+    let mut filters: Vec<SavedFilter> = vault
+        .current()
+        .settings
+        .iter()
+        .filter_map(|(key, value)| {
+            let id = Uuid::try_parse(key.strip_prefix(FILTER_PREFIX)?).ok()?;
+            let filter: SavedFilter = serde_json::from_value(value.clone()).ok()?;
+            Some(SavedFilter { id, ..filter })
+        })
+        .collect();
+    filters.sort_by(|a, b| a.name.to_lowercase().cmp(&b.name.to_lowercase()).then(a.id.cmp(&b.id)));
+    Ok(filters)
 }
 
 /// Tags of the memos in the main list (not archived), most used first.
@@ -187,7 +329,16 @@ pub fn memo_detail<S: Store>(store: &S, user_id: Uuid, id: Uuid) -> Result<MemoD
                 || cached(crate::AttachmentKind::Thumbnail)?,
         });
     }
+    let mut linked_from = Vec::new();
+    for other in store.memo_ids()? {
+        let Some(other) = store.memo(other)?.filter(|m| !m.pending_delete && m.id != id) else { continue };
+        if shown(&other).is_some_and(|p| text::linked_memos(&p.body).contains(&id)) {
+            linked_from.push(MemoLink { id: other.id, title: text::title(shown(&other).map_or("", |p| &p.body)) });
+        }
+    }
+    linked_from.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()).then(a.id.cmp(&b.id)));
     Ok(MemoDetail {
+        linked_from,
         body: payload.map(|p| p.body.clone()).unwrap_or_default(),
         edited_at: payload.map_or(0, |p| p.edited_at),
         server_version: memo.server_version,

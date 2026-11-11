@@ -1,7 +1,7 @@
 <script lang="ts">
   import { tick } from "svelte";
   import { loadAttachment } from "../lib/attachments";
-  import { backend } from "../lib/state.svelte";
+  import { backend, go } from "../lib/state.svelte";
   import type { AttachmentView } from "../lib/types";
 
   let {
@@ -71,7 +71,11 @@
 
   function click(event: MouseEvent) {
     const target = event.target as HTMLElement;
-    if (target instanceof HTMLInputElement && target.dataset.task) {
+    const memoLink = target.closest<HTMLAnchorElement>("a[data-memo]");
+    if (memoLink) {
+      event.preventDefault();
+      go(`/memo/${memoLink.dataset.memo}`);
+    } else if (target instanceof HTMLInputElement && target.dataset.task) {
       event.preventDefault();
       ontask?.(Number(target.dataset.task));
     } else if (target.classList.contains("tag") && target.dataset.tag) {
@@ -79,6 +83,13 @@
     } else if (target instanceof HTMLImageElement && target.dataset.attachment) {
       const attachment = attachments.find((a) => a.id === target.dataset.attachment);
       if (attachment) onimage?.(attachment);
+    } else if (backend.native) {
+      // The desktop window does not open new windows: links go to the default browser.
+      const link = target.closest("a[href]");
+      if (link instanceof HTMLAnchorElement) {
+        event.preventDefault();
+        backend.openLink(link.href);
+      }
     }
   }
 </script>

@@ -45,6 +45,7 @@ class AppState(val backend: Backend, val platform: Platform, val scope: Coroutin
     val screen get() = stack.last()
     val snackbar = SnackbarHostState()
     var filter by mutableStateOf(MemoFilter())
+    var theme by mutableStateOf(backend.theme)
 
     fun go(screen: Screen) {
         stack.add(screen)
@@ -125,7 +126,15 @@ fun App(backend: Backend, platform: Platform, state: (AppState) -> Unit = {}) {
         if (session !is Session.Unlocked) app.home()
     }
 
-    MaterialTheme(colorScheme = if (isSystemInDarkTheme()) Dark else Light) {
+    val dark =
+        when (app.theme) {
+            "dark" -> true
+            "light" -> false
+            else -> isSystemInDarkTheme()
+        }
+    LaunchedEffect(dark) { platform.darkBars(dark) }
+
+    MaterialTheme(colorScheme = if (dark) Dark else Light) {
         Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             Box(Modifier.fillMaxSize()) {
                 when (val s = session) {

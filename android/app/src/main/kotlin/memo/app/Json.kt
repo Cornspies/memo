@@ -2,6 +2,7 @@ package memo.app
 
 import memo.ui.AttachmentView
 import memo.ui.Block
+import memo.ui.CodeSpan
 import memo.ui.ConflictWith
 import memo.ui.Device
 import memo.ui.Inline
@@ -9,8 +10,11 @@ import memo.ui.ListItem
 import memo.ui.Me
 import memo.ui.MemberView
 import memo.ui.MemoDetail
+import memo.ui.MemoLink
 import memo.ui.MemoSummary
 import memo.ui.RevisionInfo
+import memo.ui.SavedFilter
+import memo.ui.Stats
 import memo.ui.SyncEvent
 import memo.ui.TagCount
 import memo.ui.Task
@@ -84,6 +88,29 @@ fun JSONObject.toDetail() =
             optJSONObject("conflict_with")?.let {
                 ConflictWith(it.getString("body"), it.getLong("version"), it.getLong("edited_at"))
             },
+        linkedFrom = getJSONArray("linked_from").map { MemoLink(it.getString("id"), it.getString("title")) },
+    )
+
+fun JSONObject.toSavedFilter() =
+    SavedFilter(
+        id = getString("id"),
+        name = getString("name"),
+        query = getString("query"),
+        tag = str("tag"),
+        has = getJSONArray("has").strings(),
+    )
+
+fun JSONObject.toStats() =
+    Stats(
+        memos = getInt("memos"),
+        archived = getInt("archived"),
+        words = getInt("words"),
+        tags = getInt("tags"),
+        images = getInt("images"),
+        openTasks = getInt("open_tasks"),
+        doneTasks = getInt("done_tasks"),
+        shared = getInt("shared"),
+        since = if (isNull("since")) null else getLong("since"),
     )
 
 fun JSONObject.toTagCount() = TagCount(getString("tag"), getInt("count"))
@@ -141,7 +168,11 @@ fun JSONObject.toBlock(): Block =
                     )
                 },
             )
-        "code" -> Block.Code(getString("text"))
+        "code" ->
+            Block.Code(
+                getString("text"),
+                optJSONArray("spans")?.map { CodeSpan(it.getString("text"), it.str("token")) } ?: emptyList(),
+            )
         "table" -> {
             fun cells(row: JSONArray) = (0 until row.length()).map { row.getJSONArray(it).map { c -> c.toInline() } }
             val rows = getJSONArray("rows")

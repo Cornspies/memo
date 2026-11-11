@@ -935,3 +935,62 @@ fn editor_helpers() {
     assert!(clean(&a1, id));
     assert_eq!(memo_attachment(&a1.store, id, attachment.id, AttachmentKind::Original), Err(crate::Error::NotFound));
 }
+
+#[test]
+fn filters_activity_stats_links_and_saved_filters() {
+    let mut server = Server::new();
+    let alice = user(&mut server, "alice");
+    let (mut a1, mut a2) = (Device::new(&alice), Device::new(&alice));
+    let create = |d: &mut Device, body: &str, now: i64| {
+        create_memo(&mut d.store, &d.account, MemoPayload::new(body, now), now).unwrap()
+    };
+    let target = create(&mut a1, "# Target #work", 1000);
+    let tasks = create(&mut a1, &format!("Plan\n- [ ] open\n- [x] done\nsee [target](memo:{target})"), 2000);
+    let code = create(&mut a1, "```rust\nfn x() {}\n```", 3000);
+    let archived = create(&mut a1, "old [t](memo:{target}) https://x.org", 500);
+    set_memo_state(&mut a1.store, archived, false, true).unwrap();
+    let list = |d: &Device, filter: MemoFilter| -> Vec<Uuid> {
+        memo_list(&d.store, &filter).unwrap().into_iter().map(|m| m.id).collect()
+    };
+
+    assert_eq!(list(&a1, MemoFilter { has: vec![Has::Tasks], ..Default::default() }), [tasks]);
+    assert_eq!(list(&a1, MemoFilter { has: vec![Has::OpenTasks, Has::Links], ..Default::default() }), [tasks]);
+    assert_eq!(list(&a1, MemoFilter { has: vec![Has::Code], ..Default::default() }), [code]);
+    assert!(list(&a1, MemoFilter { has: vec![Has::Images], ..Default::default() }).is_empty());
+    let day = MemoFilter { created_from: Some(1000), created_before: Some(3000), ..Default::default() };
+    assert_eq!(list(&a1, day).into_iter().collect::<BTreeSet<_>>(), BTreeSet::from([target, tasks]));
+
+    assert_eq!(activity(&a1.store).unwrap(), [1000, 2000, 3000]);
+    let s = stats(&a1.store).unwrap();
+    assert_eq!((s.memos, s.archived, s.tags, s.open_tasks, s.done_tasks, s.since), (3, 1, 1, 1, 1, Some(1000)));
+
+    // Backlinks come from every memo, archived ones included; the archived one has no valid link.
+    let detail = memo_detail(&a1.store, alice.user_id, target).unwrap();
+    assert_eq!(detail.linked_from, [MemoLink { id: tasks, title: "Plan".into() }]);
+
+    // Saved filters live in the vault and sync; two devices can add one each.
+    a1.sync(&mut server);
+    let work = MemoFilter { tag: Some("work".into()), has: vec![Has::OpenTasks], ..Default::default() };
+    let first = save_filter(&mut a1.store, " Open work ", &work).unwrap();
+    a1.sync(&mut server);
+    a2.sync(&mut server);
+    let second =
+        save_filter(&mut a2.store, "Code", &MemoFilter { has: vec![Has::Code], ..Default::default() }).unwrap();
+    let third = save_filter(&mut a1.store, "All", &MemoFilter::default()).unwrap();
+    a1.sync(&mut server);
+    a2.sync(&mut server);
+    a1.sync(&mut server);
+    let names = |d: &Device| saved_filters(&d.store).unwrap().into_iter().map(|f| (f.id, f.name)).collect::<Vec<_>>();
+    let expected = vec![(third, "All".to_owned()), (second, "Code".into()), (first, "Open work".into())];
+    assert_eq!(names(&a1), expected);
+    assert_eq!(names(&a2), expected);
+    let saved = &saved_filters(&a1.store).unwrap()[2];
+    assert_eq!(
+        (saved.tag.as_deref(), saved.has.as_slice(), saved.query.as_str()),
+        (Some("work"), &[Has::OpenTasks][..], "")
+    );
+    delete_filter(&mut a2.store, first).unwrap();
+    a2.sync(&mut server);
+    a1.sync(&mut server);
+    assert_eq!(names(&a1).len(), 2);
+}
