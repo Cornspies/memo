@@ -46,7 +46,8 @@ pub fn router(app: App) -> Router {
         .route("/memos/{id}/members", post(memos::add_member))
         .route("/memos/{id}/members/me", delete(memos::leave))
         .route("/memos/{id}/members/{user_id}", patch(memos::update_member))
-        .route("/memos/{id}/revoke", post(memos::revoke))
+        // Carries the whole memo, like a sync push.
+        .route("/memos/{id}/revoke", post(memos::revoke).layer(DefaultBodyLimit::max(SYNC_LIMIT)))
         .route("/memos/{id}/revisions", get(memos::revisions))
         .route("/memos/{id}/revisions/{version}", get(memos::revision))
         .route(

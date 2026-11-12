@@ -13,7 +13,9 @@ use memo_core::{
         Revision, RevokeResponse, SyncResponse, UserInfo,
     },
     image, render,
-    sync::{self, MemoFilter, MemoryStore, NewAttachment, NewThumbnail, PreparedRevoke, Step, Store, SyncSession},
+    sync::{
+        self, MemoFilter, MemoryStore, NewAttachment, NewThumbnail, PreparedRevoke, Step, Store, SyncSession, Views,
+    },
 };
 use serde::Serialize;
 use uuid::Uuid;
@@ -267,9 +269,14 @@ impl RecoveryCompletion {
 pub struct Client {
     account: UnlockedAccount,
     store: MemoryStore,
+    /// The list views, kept between calls until the store changes.
+    views: Views,
     session: Option<SyncSession>,
     revokes: Vec<PreparedRevoke>,
 }
+
+/// Downloaded image blobs the tab keeps. The least recently used go first.
+const BLOB_CACHE: u64 = 128 << 20;
 
 #[derive(Serialize)]
 struct UploadJson {
@@ -287,7 +294,7 @@ struct TrustJson {
 #[wasm_bindgen]
 impl Client {
     fn new(account: UnlockedAccount) -> Self {
-        Self { account, store: MemoryStore::new(), session: None, revokes: Vec::new() }
+        Self { account, store: MemoryStore::new(), views: Views::new(), session: None, revokes: Vec::new() }
     }
 
     pub fn user_id(&self) -> String {
@@ -346,7 +353,9 @@ impl Client {
 
     /// Caches a downloaded blob.
     pub fn put_blob(&mut self, attachment_id: &str, kind: &str, envelope: &[u8]) -> JsResult<()> {
-        self.store.put_blob(id(attachment_id)?, self::kind(kind)?, envelope).map_err(core)
+        self.store.put_blob(id(attachment_id)?, self::kind(kind)?, envelope).map_err(core)?;
+        self.store.trim_blobs(BLOB_CACHE);
+        Ok(())
     }
 
     /// Anything local the server does not have yet. Closing the tab would lose it.
@@ -357,23 +366,23 @@ impl Client {
     // -- Read models --
 
     /// `MemoFilter` JSON in, `MemoSummary[]` JSON out.
-    pub fn memo_list(&self, filter: &str) -> JsResult<String> {
+    pub fn memo_list(&mut self, filter: &str) -> JsResult<String> {
         let filter: MemoFilter = parse(filter)?;
-        sync::memo_list(&self.store, &filter).map(|l| json(&l)).map_err(core)
+        self.views.memo_list(&self.store, &filter).map(|l| json(&l)).map_err(core)
     }
 
-    pub fn tag_counts(&self) -> JsResult<String> {
-        sync::tag_counts(&self.store).map(|t| json(&t)).map_err(core)
+    pub fn tag_counts(&mut self) -> JsResult<String> {
+        self.views.tag_counts(&self.store).map(|t| json(&t)).map_err(core)
     }
 
     /// Creation times of the memos in the main list, for the calendar.
-    pub fn activity(&self) -> JsResult<String> {
-        sync::activity(&self.store).map(|a| json(&a)).map_err(core)
+    pub fn activity(&mut self) -> JsResult<String> {
+        self.views.activity(&self.store).map(|a| json(&a)).map_err(core)
     }
 
     /// `Stats` JSON.
-    pub fn stats(&self) -> JsResult<String> {
-        sync::stats(&self.store).map(|s| json(&s)).map_err(core)
+    pub fn stats(&mut self) -> JsResult<String> {
+        self.views.stats(&self.store).map(|s| json(&s)).map_err(core)
     }
 
     /// `SavedFilter[]` JSON.
@@ -392,8 +401,8 @@ impl Client {
     }
 
     /// `MemoDetail` JSON.
-    pub fn memo_detail(&self, memo_id: &str) -> JsResult<String> {
-        sync::memo_detail(&self.store, self.account.user_id, id(memo_id)?).map(|d| json(&d)).map_err(core)
+    pub fn memo_detail(&mut self, memo_id: &str) -> JsResult<String> {
+        self.views.memo_detail(&self.store, self.account.user_id, id(memo_id)?).map(|d| json(&d)).map_err(core)
     }
 
     /// Decrypted attachment bytes, or `undefined` if the blob is not cached yet (download it,

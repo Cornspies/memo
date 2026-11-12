@@ -1,12 +1,12 @@
 //! Store operations shared by the engine, the local edit API and sharing.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use uuid::Uuid;
 
 use super::store::{AccessRecord, AttachmentRecord, MemoRecord, Store, VaultRecord};
 use crate::{
-    Result,
+    Error, Result,
     account::UnlockedAccount,
     api::{Member, Permission},
     content::{open_attachment, seal_attachment},
@@ -27,14 +27,64 @@ pub(crate) fn transaction<S: Store + ?Sized, R>(store: &mut S, f: impl FnOnce(&m
     }
 }
 
-/// Removes a memo and everything that hangs off it from this device.
-pub(crate) fn remove_memo_locally<S: Store + ?Sized>(store: &mut S, id: Uuid) -> Result<()> {
+/// Removes a memo and everything that hangs off it from this device. Returns whether that made
+/// the vault dirty (the memo's share record goes too).
+pub(crate) fn remove_memo_locally<S: Store + ?Sized>(store: &mut S, id: Uuid) -> Result<bool> {
     for attachment in store.attachments_of(id)? {
         store.delete_attachment(attachment.id)?;
     }
     store.delete_state(id)?;
     store.delete_access(id)?;
-    store.delete_memo(id)
+    store.delete_memo(id)?;
+    forget_shares(store, id, None)
+}
+
+/// The memo's owner: the one its access record names, which the wrapped keys verify. Until that
+/// record is there, what the server said.
+pub(crate) fn owner_of<S: Store + ?Sized>(store: &S, memo: &MemoRecord) -> Result<Uuid> {
+    Ok(store.access(memo.id)?.map_or(memo.owner_id, |a| a.owner_id))
+}
+
+/// Who the account shared the memo with, by its own record in the vault.
+pub(crate) fn shared_with<S: Store + ?Sized>(store: &S, memo_id: Uuid) -> Result<BTreeSet<Uuid>> {
+    Ok(store.vault()?.and_then(|v| v.current().shares.get(&memo_id).cloned()).unwrap_or_default())
+}
+
+/// Records in the vault that the account shares `memo_id` with `user_id`.
+pub(crate) fn record_share<S: Store + ?Sized>(store: &mut S, memo_id: Uuid, user_id: Uuid) -> Result<()> {
+    let mut vault = store.vault()?.ok_or(Error::NotFound)?;
+    if vault.newer_format {
+        return Err(Error::ReadOnly);
+    }
+    if vault.current().shares.get(&memo_id).is_some_and(|users| users.contains(&user_id)) {
+        return Ok(());
+    }
+    let mut local = vault.current().clone();
+    local.shares.entry(memo_id).or_default().insert(user_id);
+    vault.local = Some(local);
+    store.put_vault(&vault)
+}
+
+/// Drops `users` (`None`: everyone) from the memo's share record. Returns whether the vault changed.
+pub(crate) fn forget_shares<S: Store + ?Sized>(store: &mut S, memo_id: Uuid, users: Option<&[Uuid]>) -> Result<bool> {
+    let Some(mut vault) = store.vault()?.filter(|v| !v.newer_format) else { return Ok(false) };
+    let Some(shared) = vault.current().shares.get(&memo_id) else { return Ok(false) };
+    let remaining: BTreeSet<Uuid> = match users {
+        Some(users) => shared.iter().filter(|u| !users.contains(u)).copied().collect(),
+        None => BTreeSet::new(),
+    };
+    if remaining.len() == shared.len() {
+        return Ok(false);
+    }
+    let mut local = vault.current().clone();
+    if remaining.is_empty() {
+        local.shares.remove(&memo_id);
+    } else {
+        local.shares.insert(memo_id, remaining);
+    }
+    vault.local = Some(local);
+    store.put_vault(&vault)?;
+    Ok(true)
 }
 
 /// Stores a new, unsynced memo owned by the account, with `memo_key[1]`.
@@ -147,6 +197,8 @@ pub(crate) enum PinCheck {
     Pinned,
     /// A different key is pinned. Use that one; raise the alarm.
     Changed(PublicKey),
+    /// Not pinned, and its username is pinned under another user id. Do not trust it; raise the alarm.
+    NameTaken,
     /// Not pinned, and the vault was written by a newer client, so it cannot be pinned now.
     Unavailable,
 }
@@ -168,6 +220,7 @@ pub(crate) fn check_pin<S: Store + ?Sized>(
     match vault.current().contacts.get(&user_id) {
         Some(contact) if contact.public_key == presented => Ok(PinCheck::Matches),
         Some(contact) => Ok(PinCheck::Changed(contact.public_key)),
+        None if name_taken(vault.current(), user_id, username) => Ok(PinCheck::NameTaken),
         None if vault.newer_format => Ok(PinCheck::Unavailable),
         None => {
             let mut local = vault.current().clone();
@@ -179,6 +232,13 @@ pub(crate) fn check_pin<S: Store + ?Sized>(
             Ok(PinCheck::Pinned)
         }
     }
+}
+
+/// Whether `username` is pinned under another user id. Usernames are unique and never change, so
+/// that is another account presented under a known name.
+pub(crate) fn name_taken(vault: &VaultPayload, user_id: Uuid, username: &str) -> bool {
+    let name = username.trim();
+    !name.is_empty() && vault.contacts.iter().any(|(id, c)| *id != user_id && c.username.eq_ignore_ascii_case(name))
 }
 
 pub(crate) fn pinned_key<S: Store + ?Sized>(store: &S, user_id: Uuid) -> Result<Option<PublicKey>> {

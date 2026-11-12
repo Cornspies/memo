@@ -69,6 +69,9 @@ So: no inline scripts or `style="…"` attributes (use classes, or Svelte's `sty
 goes through the CSSOM), no Svelte transitions (they inject `<style>` elements), no `data:` URLs.
 Rendered memo HTML comes from `memo_core::render`, which escapes raw HTML.
 
+Downloaded image blobs are kept in the tab up to 128 MiB, least recently used first out
+(`crates/wasm`).
+
 ## Not done yet
 
 - "Keep unlocked in this browser" (`docs/crypto.md#account-flows`): the keys are always in memory only.

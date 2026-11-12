@@ -259,3 +259,35 @@ fn trimming_keeps_recent_and_unsent_blobs() {
     assert_eq!(store.trim_blobs(0).unwrap(), 200);
     assert!(store.blob(ids[0], AttachmentKind::Original).unwrap().is_some());
 }
+
+#[test]
+fn views_follow_the_store() {
+    use memo_core::{AccountKey, UnlockedAccount, sync as client};
+    let account = UnlockedAccount {
+        user_id: Uuid::now_v7(),
+        account_key: AccountKey::generate(),
+        keypair: UserKeyPair::generate(),
+    };
+    let mut store = SqliteStore::open_in_memory().unwrap();
+    let mut views = client::Views::new();
+    let all = client::MemoFilter::default();
+    let id = client::create_memo(&mut store, &account, MemoPayload::new("first #tag", 1), 1).unwrap();
+    assert_eq!(views.memo_list(&store, &all).unwrap()[0].title, "first #tag");
+
+    // Reads leave the generation alone, also a blob read, which notes when it was used.
+    let generation = store.generation();
+    store.put_blob(id, AttachmentKind::Original, b"envelope").unwrap();
+    assert!(store.blob(id, AttachmentKind::Original).unwrap().is_some());
+    assert_eq!(views.tag_counts(&store).unwrap().len(), 1);
+    assert_eq!(store.generation(), generation);
+
+    client::edit_body(&mut store, id, "second", 2, false).unwrap();
+    assert_eq!(views.memo_list(&store, &all).unwrap()[0].title, "second");
+    assert!(views.tag_counts(&store).unwrap().is_empty());
+
+    store.begin().unwrap();
+    store.delete_memo(id).unwrap();
+    assert!(views.memo_list(&store, &all).unwrap().is_empty());
+    store.rollback();
+    assert_eq!(views.memo_list(&store, &all).unwrap().len(), 1);
+}

@@ -86,11 +86,11 @@ pub fn restore_revision<S: Store>(store: &mut S, id: Uuid, revision: &Revision, 
 pub fn delete_memo<S: Store>(store: &mut S, account: &UnlockedAccount, id: Uuid) -> Result<()> {
     transaction(store, |store| {
         let mut memo = existing(store, id)?;
-        if memo.owner_id != account.user_id {
+        if ops::owner_of(store, &memo)? != account.user_id {
             return Err(Error::NotOwner);
         }
         if memo.server_version == 0 {
-            return ops::remove_memo_locally(store, id);
+            return ops::remove_memo_locally(store, id).map(drop);
         }
         // Deleting from the conflict view: the user has seen their version, so delete that one.
         if let Some(conflict) = memo.conflict.take() {

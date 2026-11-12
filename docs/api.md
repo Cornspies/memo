@@ -67,7 +67,7 @@ usernames this returns a fake but stable salt; it never returns 404.
 ```
 → `201 {"device_id": "…", "token": "…"}`. For `kind: "web"` the response sets the cookie and omits `token`.
 Errors: `invite_invalid`, `conflict` (username or user_id taken), `bad_request` (KDF parameters below
-the minimum).
+the minimum, or a public key no key can be wrapped to).
 
 ### `POST /auth/login`
 ```json
@@ -173,7 +173,8 @@ Removes members and rotates the key, as one atomic operation.
   "keys": [ { "user_id": "<owner>", "wrapped_key": "…" }, { "user_id": "<remaining member>", "wrapped_key": "…" } ] }
 ```
 `keys` must cover **exactly** the remaining members, owner included. → `200 {"version": 10}`. If
-`base_version` is stale → `409`; the client syncs, re-encrypts and retries.
+`base_version` is stale → `409`; the client syncs, re-encrypts and retries. The request body limit
+is that of `/sync` (16 MiB), since it carries a whole memo.
 
 ### `DELETE /memos/{id}/members/me`
 Leave a memo shared with you. → `204`. The owner cannot leave (`403`); they delete the memo instead.
@@ -221,13 +222,18 @@ Attachments are deleted with the `attachment.delete` sync op.
 | Endpoint | Limit |
 |---|---|
 | `/auth/prelogin` | 20/min per IP |
-| `/auth/login` | 10/min per IP; per account, exponential backoff after 5 failures (no hard lockout, so nobody can lock someone else out) |
+| `/auth/login` | 10/min per IP; per username and IP, exponential backoff after 5 failures |
 | `/auth/register` | 5/hour per IP |
-| `/auth/recover*` | 5/hour per IP, 3/hour per account |
+| `/auth/recover*` | 5/hour per IP |
 | everything else | 600/min per user |
 
+The login backoff counts per username **and** client address, so failures from one address never
+keep someone at another address out. Unknown usernames are counted the same way, so the answer does
+not show which usernames exist. Checking the current `auth_key` (`/auth/password`, `DELETE /me`)
+backs off per account.
+
 The client IP is taken from `X-Forwarded-For` **only** if the connection comes from a configured
-trusted proxy address.
+trusted proxy address. An IPv6 client counts as its /64 network.
 
 ## Later (not in v1)
 

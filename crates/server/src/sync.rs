@@ -15,7 +15,7 @@ use uuid::Uuid;
 use crate::{
     auth::Session,
     config::Limits,
-    db::{self, Entity, RowExt, now_ms},
+    db::{self, Entity, Quota, RowExt, now_ms},
     error::{ApiError, ApiResult},
     state::App,
 };
@@ -31,32 +31,62 @@ pub async fn sync(
     if request.push.len() > MAX_PUSH_OPS {
         return Err(ApiError::bad_request(format!("at most {MAX_PUSH_OPS} ops per request")));
     }
+    let user = session.user_id;
+    if request.push.is_empty() {
+        // Nothing to write: a reader does it, and the writer stays free for others.
+        return app.db.read(move |conn| pull_only(conn, user, &request)).await.map(Json);
+    }
     let limits = app.config.limits.clone();
-    app.db.write(move |tx| run(tx, &limits, session.user_id, request)).await.map(Json)
+    app.db.write(move |tx| run(tx, &limits, user, request)).await.map(Json)
 }
 
 fn run(tx: &Transaction, limits: &Limits, user: Uuid, request: SyncRequest) -> ApiResult<SyncResponse> {
-    let epoch = db::epoch(tx)?;
+    let (epoch, reset) = epoch_and_reset(tx, user, &request)?;
+    if reset {
+        return Ok(reset_response(epoch));
+    }
+    let mut quota = Quota::default();
+    let results =
+        request.push.iter().map(|op| apply(tx, limits, &mut quota, user, op)).collect::<ApiResult<Vec<_>>>()?;
+    pull(tx, user, request.cursor, epoch, results)
+}
+
+fn pull_only(conn: &Connection, user: Uuid, request: &SyncRequest) -> ApiResult<SyncResponse> {
+    // One snapshot for all the reads below.
+    let snapshot = conn.unchecked_transaction()?;
+    let (epoch, reset) = epoch_and_reset(&snapshot, user, request)?;
+    if reset {
+        return Ok(reset_response(epoch));
+    }
+    pull(&snapshot, user, request.cursor, epoch, Vec::new())
+}
+
+/// The epoch, and whether the client's epoch or cursor no longer fit this database.
+fn epoch_and_reset(conn: &Connection, user: Uuid, request: &SyncRequest) -> ApiResult<(String, bool)> {
+    let epoch = db::epoch(conn)?;
     let purged_through: u64 =
-        tx.query_row("SELECT purged_through FROM users WHERE id = ?1", [user.as_bytes()], |r| r.get(0))?;
+        conn.query_row("SELECT purged_through FROM users WHERE id = ?1", [user.as_bytes()], |r| r.get(0))?;
     let max_seq: u64 =
-        tx.query_row("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'change_log'), 0)", [], |r| {
+        conn.query_row("SELECT COALESCE((SELECT seq FROM sqlite_sequence WHERE name = 'change_log'), 0)", [], |r| {
             r.get(0)
         })?;
     let cursor = request.cursor;
     let reset = request.epoch.as_ref().is_some_and(|e| *e != epoch)
         || (cursor > 0 && cursor < purged_through)
         || cursor > max_seq;
-    if reset {
-        return Ok(SyncResponse { results: vec![], changes: vec![], cursor: 0, epoch, more: false, reset: true });
-    }
+    Ok((epoch, reset))
+}
 
-    let results = request.push.iter().map(|op| apply(tx, limits, user, op)).collect::<ApiResult<Vec<_>>>()?;
+fn reset_response(epoch: String) -> SyncResponse {
+    SyncResponse { results: vec![], changes: vec![], cursor: 0, epoch, more: false, reset: true }
+}
 
+/// The page of changes after `cursor`.
+fn pull(conn: &Connection, user: Uuid, cursor: u64, epoch: String, results: Vec<OpResult>) -> ApiResult<SyncResponse> {
     let mut changes = Vec::new();
     // A full sync starts with the vault, so clients know their pins before verifying keys.
     if cursor == 0
-        && let Some(seq) = tx
+        && let Some(seq) = conn
             .query_row(
                 "SELECT seq FROM change_log WHERE user_id = ?1 AND entity_type = 'vault'",
                 [user.as_bytes()],
@@ -64,9 +94,9 @@ fn run(tx: &Transaction, limits: &Limits, user: Uuid, request: SyncRequest) -> A
             )
             .optional()?
     {
-        changes.push(render(tx, user, seq, Entity::Vault, user)?);
+        changes.extend(render(conn, user, seq, Entity::Vault, user)?);
     }
-    let rows: Vec<(u64, String, Uuid)> = tx
+    let rows: Vec<(u64, String, Uuid)> = conn
         .prepare_cached(
             "SELECT seq, entity_type, entity_id FROM change_log WHERE user_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
         )?
@@ -74,17 +104,20 @@ fn run(tx: &Transaction, limits: &Limits, user: Uuid, request: SyncRequest) -> A
             Ok((r.get(0)?, r.get(1)?, r.uuid(2)?))
         })?
         .collect::<Result<_, _>>()?;
-    let (mut page_cursor, mut count, mut bytes, mut more) = (cursor, 0, 0, false);
+    // A full batch of rows: there may be more behind it, whatever of it ends up on the page.
+    let mut more = rows.len() > PAGE_ENTITIES;
+    let (mut page_cursor, mut count, mut bytes) = (cursor, 0, 0);
     for (seq, entity, id) in rows {
         if count == PAGE_ENTITIES || (count > 0 && bytes >= PAGE_BYTES) {
             more = true;
             break;
         }
         let entity = Entity::parse(&entity).ok_or_else(|| ApiError::internal(format!("entity type {entity}")))?;
-        let change = render(tx, user, seq, entity, id)?;
+        page_cursor = seq;
+        // Nothing to send for an entity the user may no longer see.
+        let Some(change) = render(conn, user, seq, entity, id)? else { continue };
         bytes += change_size(&change);
         changes.push(change);
-        page_cursor = seq;
         count += 1;
     }
     Ok(SyncResponse { results, changes, cursor: page_cursor, epoch, more, reset: false })
@@ -101,22 +134,29 @@ fn change_size(change: &Change) -> usize {
 
 // ---- Rendering current state ----
 
-pub fn render(conn: &Connection, user: Uuid, seq: u64, entity: Entity, id: Uuid) -> ApiResult<Change> {
-    Ok(match entity {
-        Entity::Memo => Change::Memo(render_memo(conn, seq, id)?),
+/// The current state of an entity in the user's log. `None` for a live memo, or an attachment of
+/// one, that the user is not a member of: nothing of it is sent.
+pub fn render(conn: &Connection, user: Uuid, seq: u64, entity: Entity, id: Uuid) -> ApiResult<Option<Change>> {
+    Ok(Some(match entity {
+        Entity::Memo => match render_memo(conn, user, seq, id)? {
+            Some(memo) => Change::Memo(memo),
+            None => return Ok(None),
+        },
         Entity::Access => Change::Access(render_access(conn, user, seq, id)?),
         Entity::Attachment => {
             let row = conn
-                .query_row(
+                .prepare_cached(
                     "SELECT memo_id, size, thumb_size, deleted_at IS NOT NULL FROM attachments WHERE id = ?1",
-                    [id.as_bytes()],
-                    |r| {
-                        Ok((r.uuid(0)?, r.get::<_, Option<u64>>(1)?, r.get::<_, Option<u64>>(2)?, r.get::<_, bool>(3)?))
-                    },
-                )
+                )?
+                .query_row([id.as_bytes()], |r| {
+                    Ok((r.uuid(0)?, r.get::<_, Option<u64>>(1)?, r.get::<_, Option<u64>>(2)?, r.get::<_, bool>(3)?))
+                })
                 .optional()?;
             // The row is gone once its memo's tombstone was purged: still a deletion.
             let (memo_id, size, thumb_size, deleted) = row.unwrap_or((Uuid::nil(), None, None, true));
+            if !deleted && db::permission(conn, memo_id, user)?.is_none() {
+                return Ok(None);
+            }
             Change::Attachment(AttachmentChange {
                 seq,
                 id,
@@ -130,11 +170,8 @@ pub fn render(conn: &Connection, user: Uuid, seq: u64, entity: Entity, id: Uuid)
         }
         Entity::State => {
             let (pinned, archived) = conn
-                .query_row(
-                    "SELECT pinned, archived FROM memo_state WHERE memo_id = ?1 AND user_id = ?2",
-                    params![id.as_bytes(), user.as_bytes()],
-                    |r| Ok((r.get(0)?, r.get(1)?)),
-                )
+                .prepare_cached("SELECT pinned, archived FROM memo_state WHERE memo_id = ?1 AND user_id = ?2")?
+                .query_row(params![id.as_bytes(), user.as_bytes()], |r| Ok((r.get(0)?, r.get(1)?)))
                 .optional()?
                 .unwrap_or((false, false));
             Change::State(StateChange { seq, memo_id: id, pinned, archived })
@@ -146,32 +183,31 @@ pub fn render(conn: &Connection, user: Uuid, seq: u64, entity: Entity, id: Uuid)
                 })?;
             Change::Vault(VaultChange { seq, version, ciphertext })
         }
-    })
+    }))
 }
 
-fn render_memo(conn: &Connection, seq: u64, id: Uuid) -> ApiResult<MemoChange> {
+fn render_memo(conn: &Connection, user: Uuid, seq: u64, id: Uuid) -> ApiResult<Option<MemoChange>> {
     let row = conn
-        .query_row(
+        .prepare_cached(
             "SELECT owner_id, version, key_version, ciphertext, deleted, created_at, updated_at, updated_by FROM memos WHERE id = ?1",
-            [id.as_bytes()],
-            |r| {
-                Ok(MemoChange {
-                    seq,
-                    id,
-                    owner_id: r.uuid(0)?,
-                    version: r.get(1)?,
-                    key_version: r.get(2)?,
-                    ciphertext: r.get(3)?,
-                    deleted: r.get(4)?,
-                    created_at: r.get(5)?,
-                    updated_at: r.get(6)?,
-                    updated_by: r.opt_uuid(7)?,
-                })
-            },
-        )
+        )?
+        .query_row([id.as_bytes()], |r| {
+            Ok(MemoChange {
+                seq,
+                id,
+                owner_id: r.uuid(0)?,
+                version: r.get(1)?,
+                key_version: r.get(2)?,
+                ciphertext: r.get(3)?,
+                deleted: r.get(4)?,
+                created_at: r.get(5)?,
+                updated_at: r.get(6)?,
+                updated_by: r.opt_uuid(7)?,
+            })
+        })
         .optional()?;
     // The row is gone when its owner's account was deleted.
-    Ok(row.unwrap_or(MemoChange {
+    let memo = row.unwrap_or(MemoChange {
         seq,
         id,
         owner_id: Uuid::nil(),
@@ -182,7 +218,12 @@ fn render_memo(conn: &Connection, seq: u64, id: Uuid) -> ApiResult<MemoChange> {
         created_at: 0,
         updated_at: 0,
         updated_by: None,
-    }))
+    });
+    // A tombstone is for everyone who had the memo. The memo itself is for its members only.
+    if !memo.deleted && db::permission(conn, id, user)?.is_none() {
+        return Ok(None);
+    }
+    Ok(Some(memo))
 }
 
 fn render_access(conn: &Connection, user: Uuid, seq: u64, memo_id: Uuid) -> ApiResult<AccessChange> {
@@ -260,10 +301,9 @@ struct MemoRow {
 }
 
 pub(crate) fn memo_row(conn: &Connection, id: Uuid) -> rusqlite::Result<Option<(Uuid, u64, u32, bool)>> {
-    conn.query_row("SELECT owner_id, version, key_version, deleted FROM memos WHERE id = ?1", [id.as_bytes()], |r| {
-        Ok((r.uuid(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
-    })
-    .optional()
+    conn.prepare_cached("SELECT owner_id, version, key_version, deleted FROM memos WHERE id = ?1")?
+        .query_row([id.as_bytes()], |r| Ok((r.uuid(0)?, r.get(1)?, r.get(2)?, r.get(3)?)))
+        .optional()
 }
 
 fn load_memo(conn: &Connection, id: Uuid) -> rusqlite::Result<Option<MemoRow>> {
@@ -283,11 +323,11 @@ fn has_logged(conn: &Connection, user: Uuid, entity: Entity, id: Uuid) -> rusqli
     )
 }
 
-fn valid_ciphertext(limits: &Limits, ciphertext: &[u8]) -> bool {
+pub(crate) fn valid_ciphertext(limits: &Limits, ciphertext: &[u8]) -> bool {
     ciphertext.len() > ENVELOPE_OVERHEAD && ciphertext.len() as u64 <= limits.max_memo.0
 }
 
-fn apply(tx: &Transaction, limits: &Limits, user: Uuid, op: &PushOp) -> ApiResult<OpResult> {
+fn apply(tx: &Transaction, limits: &Limits, quota: &mut Quota, user: Uuid, op: &PushOp) -> ApiResult<OpResult> {
     let now = now_ms();
     Ok(match op {
         PushOp::MemoPut { id, base_version, key_version, ciphertext, wrapped_key } => {
@@ -301,23 +341,23 @@ fn apply(tx: &Transaction, limits: &Limits, user: Uuid, op: &PushOp) -> ApiResul
                 {
                     return Ok(status(OpStatus::Invalid));
                 }
-                if !db::fits_quota(tx, user, ciphertext.len() as u64, limits.default_quota.0)? {
+                if !quota.take(tx, user, ciphertext.len() as u64, limits.default_quota.0)? {
                     return Ok(status(OpStatus::QuotaExceeded));
                 }
-                tx.execute(
+                tx.prepare_cached(
                     "INSERT INTO memos (id, owner_id, version, key_version, ciphertext, created_at, updated_at, updated_by)
                      VALUES (?1, ?2, 1, 1, ?3, ?4, ?4, ?2)",
-                    params![id.as_bytes(), user.as_bytes(), ciphertext, now],
-                )?;
+                )?
+                .execute(params![id.as_bytes(), user.as_bytes(), ciphertext, now])?;
                 insert_revision(tx, id, 1, 1, ciphertext, user, now)?;
-                tx.execute(
+                tx.prepare_cached(
                     "INSERT INTO memo_members (memo_id, user_id, permission, added_at) VALUES (?1, ?2, 'write', ?3)",
-                    params![id.as_bytes(), user.as_bytes(), now],
-                )?;
-                tx.execute(
+                )?
+                .execute(params![id.as_bytes(), user.as_bytes(), now])?;
+                tx.prepare_cached(
                     "INSERT INTO memo_keys (memo_id, user_id, key_version, wrapped_key) VALUES (?1, ?2, 1, ?3)",
-                    params![id.as_bytes(), user.as_bytes(), wrapped_key],
-                )?;
+                )?
+                .execute(params![id.as_bytes(), user.as_bytes(), wrapped_key])?;
                 db::log_change(tx, user, Entity::Access, id)?;
                 db::log_change(tx, user, Entity::Memo, id)?;
                 return Ok(ok(Some(1)));
@@ -341,14 +381,14 @@ fn apply(tx: &Transaction, limits: &Limits, user: Uuid, op: &PushOp) -> ApiResul
             if !valid_ciphertext(limits, ciphertext) {
                 return Ok(status(OpStatus::Invalid));
             }
-            if !db::fits_quota(tx, memo.owner, ciphertext.len() as u64, limits.default_quota.0)? {
+            if !quota.take(tx, memo.owner, ciphertext.len() as u64, limits.default_quota.0)? {
                 return Ok(status(OpStatus::QuotaExceeded));
             }
             let version = memo.version + 1;
-            tx.execute(
+            tx.prepare_cached(
                 "UPDATE memos SET version = ?1, ciphertext = ?2, updated_at = ?3, updated_by = ?4 WHERE id = ?5",
-                params![version, ciphertext, now, user.as_bytes(), id.as_bytes()],
-            )?;
+            )?
+            .execute(params![version, ciphertext, now, user.as_bytes(), id.as_bytes()])?;
             insert_revision(tx, id, version, memo.key_version, ciphertext, user, now)?;
             db::log_for_members(tx, id, Entity::Memo, id)?;
             ok(Some(version))
@@ -370,17 +410,18 @@ fn apply(tx: &Transaction, limits: &Limits, user: Uuid, op: &PushOp) -> ApiResul
                 return Ok(conflict(memo.version));
             }
             delete_memo(tx, id)?;
+            quota.forget(memo.owner);
             ok(None)
         }
         PushOp::StatePut { memo_id, pinned, archived } => {
             if db::permission(tx, *memo_id, user)?.is_none() {
                 return Ok(status(OpStatus::NotFound));
             }
-            tx.execute(
+            tx.prepare_cached(
                 "INSERT INTO memo_state (memo_id, user_id, pinned, archived, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)
                  ON CONFLICT (memo_id, user_id) DO UPDATE SET pinned = ?3, archived = ?4, updated_at = ?5",
-                params![memo_id.as_bytes(), user.as_bytes(), pinned, archived, now],
-            )?;
+            )?
+            .execute(params![memo_id.as_bytes(), user.as_bytes(), pinned, archived, now])?;
             db::log_change(tx, user, Entity::State, *memo_id)?;
             ok(None)
         }
@@ -432,11 +473,11 @@ pub fn insert_revision(
     user: Uuid,
     now: i64,
 ) -> rusqlite::Result<()> {
-    tx.execute(
+    tx.prepare_cached(
         "INSERT INTO memo_revisions (memo_id, version, key_version, ciphertext, updated_by, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![memo_id.as_bytes(), version, key_version, ciphertext, user.as_bytes(), now],
-    )?;
+    )?
+    .execute(params![memo_id.as_bytes(), version, key_version, ciphertext, user.as_bytes(), now])?;
     Ok(())
 }
 

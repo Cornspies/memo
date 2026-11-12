@@ -52,5 +52,8 @@ and contact verification state are encrypted.
    A server that lies *at first contact* is only detected if the users compare fingerprints out of band.
 6. **The protocol is not audited.** It composes standard primitives (Argon2id, HKDF, XChaCha20-Poly1305,
    HPKE) in a conventional way, but nobody has formally reviewed this construction.
-7. **Rollback across all of a user's devices.** A client rejects memo versions lower than the highest it
-   has seen. A brand-new device, though, has no history to compare against.
+7. **Rollback across all of a user's devices.** A client rejects memo and vault versions lower than the
+   highest it has seen. A brand-new device, though, has no history to compare against: a server could
+   hand it an old vault, without the newer contact pins and share records, or old memo versions.
+8. **A member who left keeps the memo key** until the owner removes them, which rotates it. The server
+   stops sending them the memo, but the encryption alone does not keep them out.

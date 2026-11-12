@@ -1,6 +1,7 @@
 //! Garbage collection, hourly and via `memo-server gc` (`docs/server.md#background-jobs`).
 
 use std::{
+    collections::HashSet,
     fs,
     path::Path,
     time::{Duration, SystemTime},
@@ -89,6 +90,8 @@ pub fn gc_at(db: &Db, config: &Config, now: i64) -> ApiResult<GcReport> {
         )?;
         tx.execute("DELETE FROM recovery_tokens WHERE expires_at < ?1", [now])?;
         tx.execute("DELETE FROM invites WHERE used_at IS NULL AND expires_at < ?1", [now])?;
+        // Every sign-out and every web unlock leaves a revoked device behind.
+        tx.execute("DELETE FROM devices WHERE revoked_at < ?1", [tombstone_cutoff])?;
         Ok(purged)
     })?;
 
@@ -120,19 +123,17 @@ fn remove_orphans(db: &Db, config: &Config) -> ApiResult<usize> {
             removed += 1;
         }
     }
+    // A blob stored after this was read is not in it, but it is not a day old either.
+    let live: HashSet<Uuid> = db.read_blocking(|conn| {
+        Ok(conn
+            .prepare("SELECT id FROM attachments WHERE purged_at IS NULL")?
+            .query_map([], |r| r.uuid(0))?
+            .collect::<Result<_, _>>()?)
+    })?;
     for dir in read_dir(&config.data_dir.join("blobs"))? {
         for file in read_dir(&dir)? {
             let id = file.file_stem().and_then(|s| s.to_str()).and_then(|s| Uuid::try_parse(s).ok());
-            let live = match id {
-                Some(id) => db.read_blocking(|conn| {
-                    Ok(conn.query_row(
-                        "SELECT EXISTS (SELECT 1 FROM attachments WHERE id = ?1 AND purged_at IS NULL)",
-                        [id.as_bytes()],
-                        |r| r.get::<_, bool>(0),
-                    )?)
-                })?,
-                None => false,
-            };
+            let live = id.is_some_and(|id| live.contains(&id));
             if !live && old(&file) {
                 remove_if_exists(&file)?;
                 removed += 1;

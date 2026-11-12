@@ -11,16 +11,18 @@ showing the web UI (`web/`); everything else runs on the Rust side: `memo-core` 
 - **Keys:** after sign-in, the device token, account key and private key are stored in the Secret
   Service (GNOME Keyring, KWallet) under service `memo`, user `account`. The app opens without the
   password. Without a Secret Service the keys stay in memory, and every start asks for the password
-  and needs the server.
+  and needs the server. The token and keys stay on the Rust side: the web view never gets them, so
+  a script that got into it could not carry them off.
 - **Lock** removes the keys and signs the device out; the memos stay, and unlocking signs in again.
   **Sign out**, or the server revoking the device, deletes the local copy (`docs/crypto.md`).
 - **HTTP:** `ureq` with rustls and the system's certificates. The webview never talks to the server.
+  The Rust side adds the token, and once signed in it only talks to the account's server.
 - **Sync:** on start, on focus, 2 s after an edit, every 5 min, and when the network comes back.
 - **Links** in memos open in the default browser (`xdg-open`, http/https/mailto only). Exports are
   saved to the Downloads folder.
 
-Data lives in `~/.local/share/memo.desktop/`: `account.json` (server, username; no secrets) and
-`db/<user id>.db`.
+Data lives in `~/.local/share/memo.desktop/` (mode `0700`): `account.json` (server, username; no
+secrets) and `db/<user id>.db`.
 
 ## Build
 

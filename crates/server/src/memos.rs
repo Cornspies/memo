@@ -20,7 +20,7 @@ use crate::{
     db::{self, Entity, RowExt, now_ms},
     error::{ApiError, ApiResult},
     state::App,
-    sync::{insert_revision, permission_str, visible_memo},
+    sync::{insert_revision, permission_str, valid_ciphertext, visible_memo},
 };
 
 /// The memo's owner, version and key version, if the caller owns it.
@@ -146,6 +146,9 @@ pub async fn revoke(
             if request.ciphertext.len() as u64 > limits.max_memo.0 {
                 return Err(ApiError::too_large());
             }
+            if !valid_ciphertext(&limits, &request.ciphertext) {
+                return Err(ApiError::bad_request("ciphertext is not an envelope"));
+            }
             if !db::fits_quota(tx, owner, request.ciphertext.len() as u64, limits.default_quota.0)? {
                 return Err(ApiError::quota_exceeded());
             }
@@ -158,6 +161,7 @@ pub async fn revoke(
             insert_revision(tx, memo_id, new_version, request.new_key_version, &request.ciphertext, owner, now)?;
             for user in &removed {
                 tx.execute("DELETE FROM memo_members WHERE memo_id = ?1 AND user_id = ?2", params![memo_id.as_bytes(), user.as_bytes()])?;
+                db::forget_memo(tx, memo_id, *user)?;
             }
             for key in &request.keys {
                 tx.execute(
@@ -186,6 +190,7 @@ pub async fn leave(State(app): State<App>, session: Session, Path(memo_id): Path
                 "DELETE FROM memo_members WHERE memo_id = ?1 AND user_id = ?2",
                 params![memo_id.as_bytes(), session.user_id.as_bytes()],
             )?;
+            db::forget_memo(tx, memo_id, session.user_id)?;
             db::log_change(tx, session.user_id, Entity::Access, memo_id)?;
             db::log_for_members(tx, memo_id, Entity::Access, memo_id)?;
             Ok(StatusCode::NO_CONTENT)

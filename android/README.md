@@ -58,4 +58,5 @@ build-rust.sh   libmemo.so into app/src/main/jniLibs (not checked in)
 - No automated UI test; the flows were checked by hand on the emulator against a local server and
   the web client (sign-up, offline edits, images, conflicts, sharing, revoking, history, recovery).
 - Release signing is not set up.
+- The app's content is not kept out of screenshots and the recent-apps view (`FLAG_SECURE`).
 - Attachments that cannot be shown inline are not offered for download.

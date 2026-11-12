@@ -1,6 +1,6 @@
 //! Plaintext payloads (memo, vault) and their padding. See `docs/crypto.md#plaintext-payloads`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use uuid::Uuid;
@@ -63,11 +63,20 @@ pub struct VaultPayload {
     pub contacts: BTreeMap<Uuid, Contact>,
     #[serde(default)]
     pub settings: serde_json::Map<String, serde_json::Value>,
+    /// For memos the user owns: who they shared each one with. What a revocation trusts instead of
+    /// the server's member list.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub shares: BTreeMap<Uuid, BTreeSet<Uuid>>,
 }
 
 impl Default for VaultPayload {
     fn default() -> Self {
-        Self { v: VAULT_PAYLOAD_VERSION, contacts: BTreeMap::new(), settings: serde_json::Map::new() }
+        Self {
+            v: VAULT_PAYLOAD_VERSION,
+            contacts: BTreeMap::new(),
+            settings: serde_json::Map::new(),
+            shares: BTreeMap::new(),
+        }
     }
 }
 
@@ -212,6 +221,15 @@ mod tests {
         let json = br#"{"v":2,"contacts":{},"settings":{}}"#;
         assert_eq!(decode_vault(&pad(json).unwrap()).unwrap_err(), Error::UnsupportedPayloadVersion(2));
         let vault = VaultPayload::default();
+        assert_eq!(decode_vault(&encode_vault(&vault).unwrap()).unwrap(), vault);
+    }
+
+    #[test]
+    fn vault_shares_are_left_out_when_empty() {
+        let mut vault = VaultPayload::default();
+        assert_eq!(serde_json::to_string(&vault).unwrap(), r#"{"v":1,"contacts":{},"settings":{}}"#);
+        let (memo, user) = (Uuid::from_bytes([1; 16]), Uuid::from_bytes([2; 16]));
+        vault.shares.entry(memo).or_default().insert(user);
         assert_eq!(decode_vault(&encode_vault(&vault).unwrap()).unwrap(), vault);
     }
 }

@@ -86,6 +86,7 @@
             <strong>{member.username}</strong>
             {#if member.user_id === memo.owner_id}<span class="badge">Owner</span>{/if}
             <Trust trust={member.trust} />
+            {#if member.unconfirmed}<span class="badge danger">Not added by you</span>{/if}
           </div>
           <div class="actions">
             {#if member.trust === "pinned" || member.trust === "not_pinned"}
@@ -115,6 +116,14 @@
               The server now presents a different key for {member.username} than the one you saw before. This
               can mean an attack. Memos are only encrypted to the key you saw first. Ask them whether they
               reset their account.
+            </p>
+          {/if}
+          {#if member.unconfirmed}
+            <p class="notice danger small-text">
+              The server lists {member.username} as a member, but your account has no record of sharing this
+              memo with them. If you just shared it on another device, sync that device and this one.
+              Otherwise remove them: they have not been given a key by you, and removing them makes a new
+              one.
             </p>
           {/if}
         </li>

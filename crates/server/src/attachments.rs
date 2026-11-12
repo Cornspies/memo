@@ -25,6 +25,9 @@ use crate::{
     sync::visible_memo,
 };
 
+/// Bytes read from a blob at a time. Each read is a trip to the blocking thread pool.
+const DOWNLOAD_CHUNK: usize = 64 * 1024;
+
 fn parse_kind(kind: &str) -> ApiResult<AttachmentKind> {
     match kind {
         "original" => Ok(AttachmentKind::Original),
@@ -71,18 +74,24 @@ pub async fn upload(
         AttachmentKind::Thumbnail => app.config.limits.max_thumbnail.0,
     };
     let user = session.user_id;
-    app.db
-        .read(move |conn| {
-            let (.., permission) = visible_memo(conn, memo_id, user)?;
-            require_write(permission)?;
-            check_attachment_memo(conn, id, memo_id)
-        })
-        .await?;
     let declared =
         headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse::<u64>().ok());
     if declared.is_some_and(|len| len > max) {
         return Err(ApiError::too_large());
     }
+    let default_quota = app.config.limits.default_quota.0;
+    app.db
+        .read(move |conn| {
+            let (.., permission) = visible_memo(conn, memo_id, user)?;
+            require_write(permission)?;
+            check_attachment_memo(conn, id, memo_id)?;
+            // Before the body is taken in. Checked again, exactly, once its size is known.
+            if !db::fits_quota(conn, user, declared.unwrap_or(0), default_quota)? {
+                return Err(ApiError::quota_exceeded());
+            }
+            Ok(())
+        })
+        .await?;
 
     let tmp_path = app.tmp_dir().join(format!("{}.part", memo_core::b64_encode(random_bytes::<12>())));
     let mut tmp = TempFile(Some(tmp_path.clone()));
@@ -106,7 +115,6 @@ pub async fn upload(
     }
     let digest: [u8; 32] = hasher.finalize().into();
     let blob_path = app.blob_path(id, kind);
-    let default_quota = app.config.limits.default_quota.0;
 
     app.db
         .write(move |tx| {
@@ -196,7 +204,8 @@ pub async fn download(
             .await
             .map_err(|e| ApiError::internal(format!("blob {id}: {e}")))?;
         let length = file.metadata().await?.len();
-        let mut response = Body::from_stream(tokio_util::io::ReaderStream::new(file)).into_response();
+        let stream = tokio_util::io::ReaderStream::with_capacity(file, DOWNLOAD_CHUNK);
+        let mut response = Body::from_stream(stream).into_response();
         let headers = response.headers_mut();
         headers.insert(header::CONTENT_TYPE, HeaderValue::from_static("application/octet-stream"));
         headers.insert(header::CONTENT_LENGTH, HeaderValue::from(length));

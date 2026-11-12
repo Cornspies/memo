@@ -15,7 +15,7 @@ use crate::{
     auth::normalize_username,
     db::{self, Db, RowExt, now_ms, random_bytes, sha256},
     error::{ApiError, ApiResult},
-    state::db_path,
+    state::{create_private_dir, create_private_file, db_path},
 };
 
 pub struct Invite {
@@ -160,8 +160,10 @@ pub fn backup(db: &Db, data_dir: &Path, target: &Path) -> ApiResult<()> {
     if target.exists() && fs::read_dir(target)?.next().is_some() {
         return Err(ApiError::bad_request(format!("{} is not empty", target.display())));
     }
-    fs::create_dir_all(target)?;
+    create_private_dir(target)?;
     let snapshot = db_path(target);
+    // `VACUUM INTO` fills an empty file, and this one is the server user's only.
+    create_private_file(&snapshot)?;
     db.read_blocking(|conn| {
         conn.execute(
             "VACUUM INTO ?1",
@@ -181,7 +183,7 @@ pub fn restore(source: &Path, data_dir: &Path) -> ApiResult<()> {
     if !snapshot.exists() || !source.join("secret").exists() {
         return Err(ApiError::bad_request(format!("{} does not look like a memo backup", source.display())));
     }
-    fs::create_dir_all(data_dir)?;
+    create_private_dir(data_dir)?;
     let live = db_path(data_dir);
     for suffix in ["", "-wal", "-shm"] {
         let path = PathBuf::from(format!("{}{suffix}", live.display()));
@@ -189,7 +191,9 @@ pub fn restore(source: &Path, data_dir: &Path) -> ApiResult<()> {
             fs::remove_file(path)?;
         }
     }
-    fs::copy(&snapshot, &live)?;
+    // Into a private file: a copy would take the mode of the backup's.
+    create_private_file(&live)?;
+    std::io::copy(&mut fs::File::open(&snapshot)?, &mut fs::OpenOptions::new().write(true).open(&live)?)?;
     fs::copy(source.join("secret"), data_dir.join("secret"))?;
     let blobs = data_dir.join("blobs");
     if blobs.exists() {

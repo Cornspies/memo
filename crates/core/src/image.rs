@@ -75,24 +75,30 @@ pub fn clean_image(bytes: &[u8]) -> Result<CleanImage> {
 
 type Cleaned = (Vec<u8>, Option<(u32, u32)>, Option<u16>);
 
+/// `len` bytes at `at`, or `None` if they are not all there. Offsets come from the file, so the
+/// sum may not even fit (32-bit targets).
+fn bytes(b: &[u8], at: usize, len: usize) -> Option<&[u8]> {
+    b.get(at..at.checked_add(len)?)
+}
+
 fn be16(b: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_be_bytes(b.get(at..at + 2)?.try_into().ok()?))
+    Some(u16::from_be_bytes(bytes(b, at, 2)?.try_into().ok()?))
 }
 
 fn be32(b: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_be_bytes(b.get(at..at + 4)?.try_into().ok()?))
+    Some(u32::from_be_bytes(bytes(b, at, 4)?.try_into().ok()?))
 }
 
 fn le16(b: &[u8], at: usize) -> Option<u16> {
-    Some(u16::from_le_bytes(b.get(at..at + 2)?.try_into().ok()?))
+    Some(u16::from_le_bytes(bytes(b, at, 2)?.try_into().ok()?))
 }
 
 fn le32(b: &[u8], at: usize) -> Option<u32> {
-    Some(u32::from_le_bytes(b.get(at..at + 4)?.try_into().ok()?))
+    Some(u32::from_le_bytes(bytes(b, at, 4)?.try_into().ok()?))
 }
 
 fn le24(b: &[u8], at: usize) -> Option<u32> {
-    let s = b.get(at..at + 3)?;
+    let s = bytes(b, at, 3)?;
     Some(u32::from(s[0]) | u32::from(s[1]) << 8 | u32::from(s[2]) << 16)
 }
 
@@ -108,7 +114,7 @@ fn exif_orientation(tiff: &[u8]) -> Option<u16> {
     let ifd = u32_at(4)? as usize;
     let count = u16_at(ifd)? as usize;
     (0..count.min(256)).find_map(|i| {
-        let entry = ifd + 2 + i * 12;
+        let entry = ifd.checked_add(2 + i * 12)?;
         // Type 3 is SHORT; the value sits in the first two bytes of the value field.
         (u16_at(entry)? == 0x0112 && u16_at(entry + 2)? == 3).then(|| u16_at(entry + 8)).flatten()
     })
@@ -136,9 +142,10 @@ fn jpeg(b: &[u8]) -> Option<Cleaned> {
             at += 2;
             continue;
         }
+        // The length counts its own two bytes.
         let len = be16(b, at + 2)? as usize;
-        let segment = b.get(at..at + 2 + len)?;
-        let data = &segment[4..];
+        let segment = bytes(b, at, 2 + len)?;
+        let data = segment.get(4..)?;
         let keep = match marker {
             // APP1: EXIF or XMP. Read the orientation, then drop it.
             0xE1 => {
@@ -176,8 +183,8 @@ fn png(b: &[u8]) -> Option<Cleaned> {
     let mut at = 8;
     while at < b.len() {
         let len = be32(b, at)? as usize;
-        let kind = b.get(at + 4..at + 8)?;
-        let chunk = b.get(at..at + 12 + len)?;
+        let kind = bytes(b, at + 4, 4)?;
+        let chunk = bytes(b, at, len.checked_add(12)?)?;
         let data = &chunk[8..8 + len];
         match kind {
             b"IHDR" => size = Some((be32(data, 0)?, be32(data, 4)?)),
@@ -198,14 +205,15 @@ fn png(b: &[u8]) -> Option<Cleaned> {
 fn webp(b: &[u8]) -> Option<Cleaned> {
     let mut out = b"RIFF\0\0\0\0WEBP".to_vec();
     let (mut size, mut orientation) = (None, None);
-    let end = (le32(b, 4)? as usize + 8).min(b.len());
+    let end = (le32(b, 4)? as usize).checked_add(8)?.min(b.len());
     let mut at = 12;
     while at + 8 <= end {
-        let kind = b.get(at..at + 4)?;
+        let kind = bytes(b, at, 4)?;
         let len = le32(b, at + 4)? as usize;
-        let padded = len + (len & 1);
-        let chunk = b.get(at..(at + 8 + padded).min(end))?;
-        let data = b.get(at + 8..at + 8 + len)?;
+        let padded = len.checked_add(len & 1)?;
+        let chunk = b.get(at..at.checked_add(8)?.checked_add(padded)?.min(end))?;
+        // Inside the chunk, so nothing past the RIFF length is read.
+        let data = bytes(chunk, 8, len)?;
         match kind {
             b"VP8X" => size = Some((le24(data, 4)? + 1, le24(data, 7)? + 1)),
             b"VP8 " if size.is_none() => {
@@ -280,6 +288,29 @@ fn gif(b: &[u8]) -> Option<Cleaned> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn malformed_images_are_errors() {
+        // A JPEG segment shorter than its own length field.
+        assert!(clean_image(&[0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x00]).is_err());
+        assert!(clean_image(&[0xFF, 0xD8, 0xFF, 0xE1, 0x00, 0x01, 0x00]).is_err());
+        // A PNG chunk length that only fits the buffer once the sum wraps (32-bit targets).
+        let mut png = b"\x89PNG\r\n\x1a\n".to_vec();
+        png.extend_from_slice(&[0xFF, 0xFF, 0xFF, 0xFC]);
+        png.extend_from_slice(b"IHDR\0\0\0\0\0\0\0\0");
+        assert!(clean_image(&png).is_err());
+        // A WebP whose RIFF length ends inside the VP8X chunk.
+        let mut webp = b"RIFF\x0c\0\0\0WEBPVP8X\x0a\0\0\0".to_vec();
+        webp.extend_from_slice(&[0; 10]);
+        assert!(clean_image(&webp).is_err());
+        let mut webp = b"RIFF\xff\xff\xff\xffWEBPVP8X\xff\xff\xff\xff".to_vec();
+        webp.extend_from_slice(&[0; 10]);
+        assert!(clean_image(&webp).is_err());
+        // Truncated everything.
+        for start in [&b"\xFF\xD8\xFF"[..], b"\x89PNG\r\n\x1a\n", b"RIFF\0\0\0\0WEBP", b"GIF89a"] {
+            assert!(clean_image(start).is_err());
+        }
+    }
 
     fn exif(orientation: u16) -> Vec<u8> {
         let mut tiff = b"MM\0*\0\0\0\x08\0\x01".to_vec();

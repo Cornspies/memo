@@ -8,7 +8,6 @@ use std::{
 };
 
 use axum::http::HeaderMap;
-use uuid::Uuid;
 
 use crate::{
     config::Cidr,
@@ -19,11 +18,29 @@ pub const MINUTE: Duration = Duration::from_secs(60);
 pub const HOUR: Duration = Duration::from_secs(3600);
 const FREE_LOGIN_FAILURES: u32 = 5;
 const MAX_LOGIN_DELAY: u64 = 15 * 60;
+/// Entries per table. Past it the table is emptied: an attacker with that many addresses is not
+/// held back by per-address limits anyway, and the memory stays bounded.
+const MAX_ENTRIES: usize = 100_000;
 
 #[derive(Default)]
 pub struct RateLimiter {
     windows: Mutex<HashMap<(&'static str, String), Window>>,
-    login_failures: Mutex<HashMap<Uuid, Failures>>,
+    login_failures: Mutex<HashMap<String, Failures>>,
+}
+
+/// What a client address counts as: itself, or its /64 network for IPv6 (one customer usually
+/// has a whole /64 to pick addresses from).
+pub fn address_key(ip: IpAddr) -> String {
+    match ip {
+        IpAddr::V4(v4) => v4.to_string(),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => v4.to_string(),
+            None => {
+                let [a, b, c, d, ..] = v6.segments();
+                format!("{a:x}:{b:x}:{c:x}:{d:x}::/64")
+            }
+        },
+    }
 }
 
 struct Window {
@@ -42,6 +59,12 @@ impl RateLimiter {
     pub fn check(&self, scope: &'static str, key: impl Into<String>, limit: u32, period: Duration) -> ApiResult<()> {
         let now = Instant::now();
         let mut windows = self.windows.lock().unwrap_or_else(PoisonError::into_inner);
+        if windows.len() >= MAX_ENTRIES {
+            windows.retain(|_, w| now.duration_since(w.start) < w.period);
+            if windows.len() >= MAX_ENTRIES {
+                windows.clear();
+            }
+        }
         let window = windows.entry((scope, key.into())).or_insert(Window { start: now, period, count: 0 });
         if now.duration_since(window.start) >= period {
             *window = Window { start: now, period, count: 0 };
@@ -54,11 +77,12 @@ impl RateLimiter {
         Ok(())
     }
 
-    /// Exponential backoff after repeated failures, but never a hard lockout: that would let
-    /// anyone lock someone else out.
-    pub fn check_login(&self, user_id: Uuid) -> ApiResult<()> {
+    /// Exponential backoff after repeated failures for `key`. Logins key it by username and
+    /// client address, so failures from one address never keep someone at another address out,
+    /// and they count unknown usernames too, so the backoff does not show which ones exist.
+    pub fn check_login(&self, key: &str) -> ApiResult<()> {
         let failures = self.login_failures.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(f) = failures.get(&user_id).filter(|f| f.count >= FREE_LOGIN_FAILURES) {
+        if let Some(f) = failures.get(key).filter(|f| f.count >= FREE_LOGIN_FAILURES) {
             let delay = Duration::from_secs((1u64 << (f.count - FREE_LOGIN_FAILURES).min(10)).min(MAX_LOGIN_DELAY));
             let elapsed = f.last.elapsed();
             if elapsed < delay {
@@ -68,15 +92,18 @@ impl RateLimiter {
         Ok(())
     }
 
-    pub fn login_failed(&self, user_id: Uuid) {
+    pub fn login_failed(&self, key: &str) {
         let mut failures = self.login_failures.lock().unwrap_or_else(PoisonError::into_inner);
-        let entry = failures.entry(user_id).or_insert(Failures { count: 0, last: Instant::now() });
+        if failures.len() >= MAX_ENTRIES {
+            failures.clear();
+        }
+        let entry = failures.entry(key.to_owned()).or_insert(Failures { count: 0, last: Instant::now() });
         entry.count += 1;
         entry.last = Instant::now();
     }
 
-    pub fn login_succeeded(&self, user_id: Uuid) {
-        self.login_failures.lock().unwrap_or_else(PoisonError::into_inner).remove(&user_id);
+    pub fn login_succeeded(&self, key: &str) {
+        self.login_failures.lock().unwrap_or_else(PoisonError::into_inner).remove(key);
     }
 
     /// Drops expired windows and old failure records.
@@ -130,14 +157,36 @@ mod tests {
     #[test]
     fn login_backoff_starts_after_five_failures() {
         let limiter = RateLimiter::default();
-        let user = Uuid::now_v7();
+        let user = "alice 203.0.113.9";
         for _ in 0..5 {
             limiter.check_login(user).unwrap();
             limiter.login_failed(user);
         }
         assert!(limiter.check_login(user).is_err());
+        limiter.check_login("alice 198.51.100.7").unwrap();
         limiter.login_succeeded(user);
         limiter.check_login(user).unwrap();
+    }
+
+    #[test]
+    fn addresses_count_as_their_network() {
+        let key = |ip: &str| address_key(ip.parse().unwrap());
+        assert_eq!(key("203.0.113.9"), "203.0.113.9");
+        assert_eq!(key("::ffff:203.0.113.9"), "203.0.113.9");
+        assert_eq!(key("2001:db8:1:2:aaaa:bbbb:cccc:dddd"), "2001:db8:1:2::/64");
+        assert_eq!(key("2001:db8:1:2::1"), key("2001:db8:1:2:ffff::9"));
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+    }
+
+    #[test]
+    fn tables_stay_bounded() {
+        let limiter = RateLimiter::default();
+        for i in 0..MAX_ENTRIES + 10 {
+            limiter.check("t", i.to_string(), 1, HOUR).unwrap();
+            limiter.login_failed(&i.to_string());
+        }
+        assert!(limiter.windows.lock().unwrap().len() <= MAX_ENTRIES);
+        assert!(limiter.login_failures.lock().unwrap().len() <= MAX_ENTRIES);
     }
 
     #[test]

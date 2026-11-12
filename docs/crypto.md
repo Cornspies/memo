@@ -132,6 +132,9 @@ Auth mode lets a member verify that the key really came from the memo's owner. W
 server could invent a memo key, wrap it for you, and slip a fake "shared" memo into your account.
 The owner wraps keys for themselves the same way (`member_id = owner_id`).
 
+A public key that is a low-order point makes the key agreement fail. The server rejects such keys at
+registration, and a client that is given one reports an error instead of wrapping.
+
 **Members verify every received key.** They open the HPKE with the **pinned** public key of
 `owner_id`. If it fails, the memo is not shown, and the user sees a warning naming the owner.
 
@@ -139,17 +142,23 @@ Operations (HTTP details in [api.md](api.md)):
 
 - **Create:** the client generates `memo_key[1]` and wraps it for itself.
 - **Share:** only the owner can share. The owner looks up the recipient's public key (pinning it, see
-  below) and wraps **every existing** `key_version` for them, so they can read the history.
+  below) and wraps **every existing** `key_version` for them, so they can read the history. The
+  client also records the recipient in the vault (`shares`, see *Vault payload*). This record, not the
+  server's member list, says who the owner gave access to.
 - **Change permission:** no cryptography. The server enforces it (see threat-model limitation 2).
 - **Revoke:** the owner's client generates `memo_key[n+1]`, re-encrypts the current payload as a new
-  version under it, and wraps it for the remaining members. The client works out the list of remaining
-  members **from its own view of who should have access**, not by trusting the server's list blindly.
-  The server applies all of this atomically. Old key versions stay with the remaining members so they
+  version under it, and wraps it for the remaining members. A remaining member must be listed by the
+  server **and** recorded in the owner's vault (`shares`), with a pinned key equal to the one the
+  server presents. If the server lists someone the vault does not know, the client refuses: the owner
+  removes that user in the same step (or, if another of their devices just shared the memo, syncs
+  first). So a server cannot get a memo key by adding itself to a member list. The revoked users are
+  removed from `shares`. The server applies all of this atomically. Old key versions stay with the remaining members so they
   can read history. Attachment keys live inside the payload and are **not** rotated: a former member who
   kept an old payload could decrypt attachments they could already see, but the server refuses to serve
   them any blob.
-- **Leave:** a member removes their own access. No rotation happens, since they leave voluntarily.
-  The owner can still rotate afterwards.
+- **Leave:** a member removes their own access. No rotation happens, since they leave voluntarily,
+  and the owner's `shares` record of them stays. The server stops sending them the memo. The owner
+  can still rotate afterwards by removing them.
 
 ## Contact keys (trust on first use)
 
@@ -161,6 +170,11 @@ The vault syncs, so all of a user's devices share the same pins.
 If the server later returns a different key for a pinned user, the client treats it as an attack:
 it refuses to share with or accept keys from that user and shows a prominent warning. Since user key
 pairs never change, there is no legitimate reason for this to happen.
+
+Pins are kept per user id, but people choose each other by name. Usernames are unique and never
+change, so a **pinned username that appears under another user id** is handled the same way: the
+client does not pin it, does not share with it and does not accept keys from it. Members are shown
+under the username they were pinned with.
 
 Fingerprint, for out-of-band verification:
 
@@ -225,9 +239,13 @@ to update instead.
   "contacts": {
     "<user_id>": { "username": "alice", "public_key": "<base64url>", "pinned_at": 1761480000000, "verified": false }
   },
-  "settings": {}
+  "settings": {},
+  "shares": { "<memo_id>": ["<user_id>"] }
 }
 ```
+
+- `shares` lists, for each memo the user owns and shared, the users they shared it with. It is left
+  out when empty. Clients read it when they revoke (see *Memo keys and sharing*).
 
 - `settings` keys starting with `filter/` are saved filters, one key per filter (`filter/<uuid>`), so
   two devices can add filters at the same time:

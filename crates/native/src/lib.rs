@@ -24,7 +24,7 @@ use memo_core::{
         Revision, RevokeResponse, SyncResponse, UserInfo,
     },
     b64_decode, b64_encode, image, render,
-    sync::{self, MemoFilter, NewAttachment, NewThumbnail, PreparedRevoke, Step, Store, SyncSession},
+    sync::{self, MemoFilter, NewAttachment, NewThumbnail, PreparedRevoke, Step, Store, SyncSession, Views},
 };
 use memo_sqlite::SqliteStore;
 use serde::{Deserialize, Serialize};
@@ -310,6 +310,8 @@ enum Pending {
 struct Client {
     account: UnlockedAccount,
     store: SqliteStore,
+    /// The list views, kept between calls until the store changes.
+    views: Views,
     session: Option<SyncSession>,
     revokes: Vec<PreparedRevoke>,
 }
@@ -358,7 +360,7 @@ fn handle(state: &mut State, request: Request, data: Option<&[u8]>) -> Result<Re
     use Request::*;
     match request {
         Init { dir } => {
-            std::fs::create_dir_all(&dir).map_err(|e| Fail::new("store", e))?;
+            create_private_dir(&dir).map_err(|e| Fail::new("store", e))?;
             state.dir = Some(dir);
             reply(())
         }
@@ -535,14 +537,14 @@ fn client_call(c: &mut Client, request: Request, data: Option<&[u8]>) -> Result<
         TrimBlobs { budget } => reply(store.trim_blobs(budget)?),
         HasUnsynced => reply(sync::has_unsynced(store)?),
 
-        MemoList { filter } => reply(sync::memo_list(store, &filter)?),
-        TagCounts => reply(sync::tag_counts(store)?),
-        Activity => reply(sync::activity(store)?),
-        Stats => reply(sync::stats(store)?),
+        MemoList { filter } => reply(c.views.memo_list(store, &filter)?),
+        TagCounts => reply(c.views.tag_counts(store)?),
+        Activity => reply(c.views.activity(store)?),
+        Stats => reply(c.views.stats(store)?),
         SavedFilters => reply(sync::saved_filters(store)?),
         SaveFilter { name, filter } => reply(sync::save_filter(store, &name, &filter)?),
         DeleteFilter { filter_id } => reply(sync::delete_filter(store, filter_id)?),
-        MemoDetail { memo_id } => reply(sync::memo_detail(store, account.user_id, memo_id)?),
+        MemoDetail { memo_id } => reply(c.views.memo_detail(store, account.user_id, memo_id)?),
         Attachment { memo_id, attachment_id, kind } => {
             bytes(sync::memo_attachment(store, memo_id, attachment_id, kind)?)
         }
@@ -626,8 +628,19 @@ fn open(state: &mut State, account: UnlockedAccount) -> Result<Reply> {
             private_key: b64_encode(account.keypair.secret_bytes().as_slice()),
         },
     };
-    state.client = Some(Client { account, store, session: None, revokes: Vec::new() });
+    state.client = Some(Client { account, store, views: Views::new(), session: None, revokes: Vec::new() });
     reply(opened)
+}
+
+/// The databases hold decrypted memos and their keys: the directory is for this user only.
+fn create_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
 }
 
 fn kdf_config(salt: Salt, params: KdfParams) -> KdfConfig {

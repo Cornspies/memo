@@ -29,7 +29,7 @@ use uuid::Uuid;
 use crate::{
     db::{self, Entity, RowExt, now_ms, random_bytes, sha256},
     error::{ApiError, ApiResult},
-    ratelimit::{HOUR, MINUTE},
+    ratelimit::{HOUR, MINUTE, address_key},
     state::{App, AppState},
 };
 
@@ -71,8 +71,14 @@ fn verify_dummy(secret: &[u8]) {
     verify_credential(secret, DUMMY.get_or_init(|| hash_credential(&[0; 32])));
 }
 
-async fn blocking<R: Send + 'static>(f: impl FnOnce() -> R + Send + 'static) -> ApiResult<R> {
+/// Runs Argon2 off the async threads, a few at a time (`AppState::hashing`).
+async fn hashing<R: Send + 'static>(app: &AppState, f: impl FnOnce() -> R + Send + 'static) -> ApiResult<R> {
+    let _slot = app.hashing.acquire().await.map_err(ApiError::internal)?;
     tokio::task::spawn_blocking(f).await.map_err(ApiError::internal)
+}
+
+fn invite_invalid() -> ApiError {
+    ApiError::new(StatusCode::FORBIDDEN, memo_core::api::ErrorCode::InviteInvalid, "invalid invite")
 }
 
 // ---- Sessions ----
@@ -251,7 +257,7 @@ pub async fn prelogin(
     Extension(ClientIp(ip)): Extension<ClientIp>,
     Json(request): Json<PreloginRequest>,
 ) -> ApiResult<Json<PreloginResponse>> {
-    app.limiter.check("prelogin", ip.to_string(), 20, MINUTE)?;
+    app.limiter.check("prelogin", address_key(ip), 20, MINUTE)?;
     let username = request.username.trim().to_lowercase();
     let lookup = username.clone();
     let found = app
@@ -280,12 +286,15 @@ pub async fn register(
     Extension(ClientIp(ip)): Extension<ClientIp>,
     Json(request): Json<RegisterRequest>,
 ) -> ApiResult<Response> {
-    app.limiter.check("register", ip.to_string(), 5, HOUR)?;
+    app.limiter.check("register", address_key(ip), 5, HOUR)?;
     let username = normalize_username(&request.username)?;
     check_device(&request.device)?;
     check_kdf(&request.kdf)?;
     if request.user_id.get_version_num() != 7 {
         return Err(ApiError::bad_request("user_id must be a UUIDv7"));
+    }
+    if !request.public_key.is_usable() {
+        return Err(ApiError::bad_request("public_key is not a key anything can be wrapped to"));
     }
     check_wrapped_key(&request.enc_account_key, "enc_account_key")?;
     check_wrapped_key(&request.enc_account_key_recovery, "enc_account_key_recovery")?;
@@ -293,15 +302,29 @@ pub async fn register(
     if request.vault.len() > app.config.limits.max_memo.0 as usize {
         return Err(ApiError::too_large());
     }
+    // An invite that does not work is not worth two Argon2 runs. The transaction checks it again.
+    let invite_hash = sha256(request.invite_code.trim().as_bytes());
+    let usable = app
+        .db
+        .read(move |conn| {
+            Ok(conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM invites WHERE code_hash = ?1 AND used_at IS NULL AND expires_at > ?2)",
+                params![invite_hash, now_ms()],
+                |r| r.get::<_, bool>(0),
+            )?)
+        })
+        .await?;
+    if !usable {
+        return Err(invite_invalid());
+    }
     let auth_key = *request.auth_key.as_bytes();
     let recovery_key = *request.recovery_auth_key.as_bytes();
     let (auth_hash, recovery_hash) =
-        blocking(move || (hash_credential(&auth_key), hash_credential(&recovery_key))).await?;
+        hashing(&app, move || (hash_credential(&auth_key), hash_credential(&recovery_key))).await?;
 
     let device = app
         .db
         .write(move |tx| {
-            let invite_hash = sha256(request.invite_code.trim().as_bytes());
             let role: String = tx
                 .query_row(
                     "SELECT role FROM invites WHERE code_hash = ?1 AND used_at IS NULL AND expires_at > ?2",
@@ -309,7 +332,7 @@ pub async fn register(
                     |r| r.get(0),
                 )
                 .optional()?
-                .ok_or_else(|| ApiError::new(StatusCode::FORBIDDEN, memo_core::api::ErrorCode::InviteInvalid, "invalid invite"))?;
+                .ok_or_else(invite_invalid)?;
             let taken: bool = tx.query_row(
                 "SELECT EXISTS (SELECT 1 FROM users WHERE username = ?1 OR id = ?2)",
                 params![username, request.user_id.as_bytes()],
@@ -363,9 +386,13 @@ pub async fn login(
     headers: HeaderMap,
     Json(request): Json<LoginRequest>,
 ) -> ApiResult<Response> {
-    app.limiter.check("login", ip.to_string(), 10, MINUTE)?;
+    app.limiter.check("login", address_key(ip), 10, MINUTE)?;
     check_device(&request.device)?;
-    let username = request.username.trim().to_lowercase();
+    // No account has a name like this.
+    let username = normalize_username(&request.username).map_err(|_| ApiError::invalid_credentials())?;
+    // Counted per name and address, for names that do not exist too (`docs/api.md#rate-limits`).
+    let attempt = format!("{username} {}", address_key(ip));
+    app.limiter.check_login(&attempt)?;
     let user = app
         .db
         .read(move |conn| {
@@ -389,15 +416,15 @@ pub async fn login(
         .await?;
     let auth_key = *request.auth_key.as_bytes();
     let Some((user_id, auth_hash, public_key, enc_account_key, enc_private_key)) = user else {
-        blocking(move || verify_dummy(&auth_key)).await?;
+        hashing(&app, move || verify_dummy(&auth_key)).await?;
+        app.limiter.login_failed(&attempt);
         return Err(ApiError::invalid_credentials());
     };
-    app.limiter.check_login(user_id)?;
-    if !blocking(move || verify_credential(&auth_key, &auth_hash)).await? {
-        app.limiter.login_failed(user_id);
+    if !hashing(&app, move || verify_credential(&auth_key, &auth_hash)).await? {
+        app.limiter.login_failed(&attempt);
         return Err(ApiError::invalid_credentials());
     }
-    app.limiter.login_succeeded(user_id);
+    app.limiter.login_succeeded(&attempt);
     let previous = bearer(&headers).or_else(|| cookie(&headers)).map(|token| sha256(token.as_bytes()));
     let device = app
         .db
@@ -437,14 +464,17 @@ fn current_auth_hash(conn: &Connection, user_id: Uuid) -> ApiResult<String> {
     Ok(conn.query_row("SELECT auth_hash FROM users WHERE id = ?1", [user_id.as_bytes()], |r| r.get(0))?)
 }
 
-/// Checks the caller's current `auth_key` (password change, account deletion).
+/// Checks the caller's current `auth_key` (password change, account deletion). Its backoff is
+/// apart from the login's: a stolen session cannot keep the owner from signing in.
 pub async fn verify_current_auth_key(app: &App, user_id: Uuid, auth_key: [u8; 32]) -> ApiResult<()> {
-    app.limiter.check_login(user_id)?;
+    let attempt = format!("account {user_id}");
+    app.limiter.check_login(&attempt)?;
     let hash = app.db.read(move |conn| current_auth_hash(conn, user_id)).await?;
-    if !blocking(move || verify_credential(&auth_key, &hash)).await? {
-        app.limiter.login_failed(user_id);
+    if !hashing(app, move || verify_credential(&auth_key, &hash)).await? {
+        app.limiter.login_failed(&attempt);
         return Err(ApiError::invalid_credentials());
     }
+    app.limiter.login_succeeded(&attempt);
     Ok(())
 }
 
@@ -457,7 +487,7 @@ pub async fn change_password(
     check_kdf(&request.new.kdf)?;
     check_wrapped_key(&request.new.enc_account_key, "enc_account_key")?;
     let new_key = *request.new.auth_key.as_bytes();
-    let auth_hash = blocking(move || hash_credential(&new_key)).await?;
+    let auth_hash = hashing(&app, move || hash_credential(&new_key)).await?;
     app.db
         .write(move |tx| {
             let kdf = request.new.kdf;
@@ -491,9 +521,8 @@ pub async fn recover(
     Extension(ClientIp(ip)): Extension<ClientIp>,
     Json(request): Json<RecoverRequest>,
 ) -> ApiResult<Json<RecoverResponse>> {
-    app.limiter.check("recover", ip.to_string(), 5, HOUR)?;
+    app.limiter.check("recover", address_key(ip), 5, HOUR)?;
     let username = request.username.trim().to_lowercase();
-    app.limiter.check("recover-account", username.clone(), 3, HOUR)?;
     let user = app
         .db
         .read(move |conn| {
@@ -517,10 +546,10 @@ pub async fn recover(
         .await?;
     let key = *request.recovery_auth_key.as_bytes();
     let Some((user_id, recovery_hash, enc_account_key_recovery, public_key, enc_private_key)) = user else {
-        blocking(move || verify_dummy(&key)).await?;
+        hashing(&app, move || verify_dummy(&key)).await?;
         return Err(ApiError::invalid_credentials());
     };
-    if !blocking(move || verify_credential(&key, &recovery_hash)).await? {
+    if !hashing(&app, move || verify_credential(&key, &recovery_hash)).await? {
         return Err(ApiError::invalid_credentials());
     }
     let token = b64_encode(random_bytes::<32>());
@@ -543,14 +572,14 @@ pub async fn recover_complete(
     Extension(ClientIp(ip)): Extension<ClientIp>,
     Json(request): Json<RecoverCompleteRequest>,
 ) -> ApiResult<Response> {
-    app.limiter.check("recover", ip.to_string(), 5, HOUR)?;
+    app.limiter.check("recover", address_key(ip), 5, HOUR)?;
     check_device(&request.device)?;
     check_kdf(&request.kdf)?;
     check_wrapped_key(&request.enc_account_key, "enc_account_key")?;
     check_wrapped_key(&request.enc_account_key_recovery, "enc_account_key_recovery")?;
     let (auth_key, recovery_key) = (*request.auth_key.as_bytes(), *request.recovery_auth_key.as_bytes());
     let (auth_hash, recovery_hash) =
-        blocking(move || (hash_credential(&auth_key), hash_credential(&recovery_key))).await?;
+        hashing(&app, move || (hash_credential(&auth_key), hash_credential(&recovery_key))).await?;
     let device = app
         .db
         .write(move |tx| {

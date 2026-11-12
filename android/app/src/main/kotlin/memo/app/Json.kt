@@ -66,6 +66,7 @@ fun JSONObject.toDetail() =
                     it.getString("permission"),
                     it.getString("trust"),
                     it.getString("fingerprint"),
+                    it.getBoolean("unconfirmed"),
                 )
             },
         attachments =

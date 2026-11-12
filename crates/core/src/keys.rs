@@ -137,6 +137,11 @@ impl PublicKey {
     pub(crate) fn to_hpke(self) -> <Kem as hpke::Kem>::PublicKey {
         <Kem as hpke::Kem>::PublicKey::from_bytes(&self.0).expect("32 bytes is a valid X25519 public key")
     }
+
+    /// False for a low-order point: no key can be wrapped to it (the key agreement yields zero).
+    pub fn is_usable(&self) -> bool {
+        Kem::encap_with_rng(&self.to_hpke(), None, &mut os_rng()).is_ok()
+    }
 }
 
 impl fmt::Debug for PublicKey {

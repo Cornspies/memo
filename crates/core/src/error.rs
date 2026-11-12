@@ -36,6 +36,9 @@ pub enum Error {
     KeyChanged(uuid::Uuid),
     #[error("no pinned public key for user {0}")]
     NotPinned(uuid::Uuid),
+    /// The server lists a member the owner's vault has no share record for.
+    #[error("user {0} is listed as a member, but this account never shared the memo with them")]
+    UnknownMember(uuid::Uuid),
     /// Returned by [`crate::Store`] implementations.
     #[error("local store: {0}")]
     Store(String),
@@ -59,6 +62,7 @@ impl Error {
             InConflict => "in_conflict",
             KeyChanged(_) => "key_changed",
             NotPinned(_) => "not_pinned",
+            UnknownMember(_) => "unknown_member",
             Store(_) => "store",
         }
     }

@@ -1,17 +1,23 @@
 //! Read models for the UI: the memo list, one memo, tags and contact trust. They never expose keys.
 
-use std::collections::BTreeMap;
+use std::{
+    cell::OnceCell,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use super::store::{MemoRecord, PushError, Store, UndecodedReason};
+use super::{
+    ops,
+    store::{MemoRecord, PushError, Store, UndecodedReason},
+};
 use crate::{
     Error, Result,
     api::{Permission, Revision, UserInfo},
     content::{MemoContext, open_memo},
     keys::PublicKey,
-    payload::{MemoPayload, ThumbRef},
+    payload::{MemoPayload, ThumbRef, VaultPayload},
     share::fingerprint,
     text,
 };
@@ -143,11 +149,15 @@ pub struct MemoDetail {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct MemberView {
     pub user_id: Uuid,
+    /// The name the user was pinned with, or the one the server gives if there is no pin.
     pub username: String,
     pub permission: Permission,
     pub trust: Trust,
     /// Of the pinned key, or of the presented one if there is no pin.
     pub fingerprint: String,
+    /// On a memo the user owns: the server lists this member, but the user's own record
+    /// (the vault) does not have them. A revocation will not give them the new key.
+    pub unconfirmed: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
@@ -158,7 +168,8 @@ pub enum Trust {
     Verified,
     Pinned,
     NotPinned,
-    /// The server presents a different key than the pinned one. Possible attack.
+    /// The server presents a different key than the pinned one, or a pinned name under another
+    /// user id. Possible attack.
     Changed,
 }
 
@@ -188,78 +199,215 @@ pub struct TagCount {
     pub count: usize,
 }
 
-/// The memo list: pinned first, then the most recently changed.
+/// One memo as the list views need it.
+struct Entry {
+    summary: MemoSummary,
+    body: String,
+    contents: OnceCell<text::Contents>,
+    links: OnceCell<BTreeSet<Uuid>>,
+}
+
+impl Entry {
+    fn contents(&self) -> &text::Contents {
+        self.contents.get_or_init(|| text::contents(&self.body))
+    }
+
+    /// The memos this one links to.
+    fn links(&self) -> &BTreeSet<Uuid> {
+        self.links.get_or_init(|| text::linked_memos(&self.body))
+    }
+}
+
+/// The read models over all memos (list, tags, calendar, statistics, backlinks). They share one
+/// pass over the store, kept until the store changes ([`Store::generation`]). A client keeps one
+/// `Views` next to its store, for as long as that store is open.
+#[derive(Default)]
+pub struct Views {
+    cached: Option<(u64, Vec<Entry>)>,
+}
+
+impl Views {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every memo the UI can show.
+    fn entries<S: Store>(&mut self, store: &S) -> Result<&[Entry]> {
+        let generation = store.generation();
+        if self.cached.as_ref().is_none_or(|(cached, _)| *cached != generation) {
+            let mut entries = Vec::new();
+            for id in store.memo_ids()? {
+                if let Some(memo) = store.memo(id)?.filter(|m| !m.pending_delete) {
+                    entries.push(Entry {
+                        summary: summarize(store, &memo)?,
+                        body: shown(&memo).map(|p| p.body.clone()).unwrap_or_default(),
+                        contents: OnceCell::new(),
+                        links: OnceCell::new(),
+                    });
+                }
+            }
+            self.cached = Some((generation, entries));
+        }
+        Ok(self.cached.as_ref().map_or(&[], |(_, entries)| entries))
+    }
+
+    /// The memo list: pinned first, then the most recently changed.
+    pub fn memo_list<S: Store>(&mut self, store: &S, filter: &MemoFilter) -> Result<Vec<MemoSummary>> {
+        let terms: Vec<String> = filter.query.split_whitespace().map(str::to_lowercase).collect();
+        let tag = filter.tag.as_deref().map(str::to_lowercase);
+        let mut list = Vec::new();
+        for entry in self.entries(store)? {
+            let summary = &entry.summary;
+            if summary.archived != filter.archived
+                || tag.as_ref().is_some_and(|t| !summary.tags.contains(t))
+                || filter.created_from.is_some_and(|from| summary.created_at < from)
+                || filter.created_before.is_some_and(|before| summary.created_at >= before)
+            {
+                continue;
+            }
+            if !terms.is_empty() {
+                let body = entry.body.to_lowercase();
+                if !terms.iter().all(|t| body.contains(t.as_str())) {
+                    continue;
+                }
+            }
+            if !filter.has.iter().all(|has| has.matches(entry.contents(), summary.images)) {
+                continue;
+            }
+            list.push(summary.clone());
+        }
+        list.sort_by(|a, b| b.pinned.cmp(&a.pinned).then(b.updated_at.cmp(&a.updated_at)).then(b.id.cmp(&a.id)));
+        Ok(list)
+    }
+
+    /// When the memos in the main list (not archived) were created, oldest first, for a calendar.
+    pub fn activity<S: Store>(&mut self, store: &S) -> Result<Vec<i64>> {
+        let mut times: Vec<i64> =
+            self.entries(store)?.iter().filter(|e| !e.summary.archived).map(|e| e.summary.created_at).collect();
+        times.sort_unstable();
+        Ok(times)
+    }
+
+    pub fn stats<S: Store>(&mut self, store: &S) -> Result<Stats> {
+        let mut stats = Stats::default();
+        let mut tags = BTreeSet::new();
+        for entry in self.entries(store)? {
+            let summary = &entry.summary;
+            if summary.archived {
+                stats.archived += 1;
+                continue;
+            }
+            let contents = entry.contents();
+            stats.memos += 1;
+            stats.words += contents.words;
+            stats.images += summary.images;
+            stats.open_tasks += contents.open_tasks;
+            stats.done_tasks += contents.done_tasks;
+            stats.shared += usize::from(summary.shared);
+            stats.since = Some(stats.since.map_or(summary.created_at, |s| s.min(summary.created_at)));
+            tags.extend(&summary.tags);
+        }
+        stats.tags = tags.len();
+        Ok(stats)
+    }
+
+    /// Tags of the memos in the main list (not archived), most used first.
+    pub fn tag_counts<S: Store>(&mut self, store: &S) -> Result<Vec<TagCount>> {
+        let mut counts: BTreeMap<&str, usize> = BTreeMap::new();
+        for entry in self.entries(store)?.iter().filter(|e| !e.summary.archived) {
+            for tag in &entry.summary.tags {
+                *counts.entry(tag).or_default() += 1;
+            }
+        }
+        let mut tags: Vec<TagCount> =
+            counts.into_iter().map(|(tag, count)| TagCount { tag: tag.to_owned(), count }).collect();
+        tags.sort_by(|a, b| b.count.cmp(&a.count).then(a.tag.cmp(&b.tag)));
+        Ok(tags)
+    }
+
+    pub fn memo_detail<S: Store>(&mut self, store: &S, user_id: Uuid, id: Uuid) -> Result<MemoDetail> {
+        let memo = store.memo(id)?.filter(|m| !m.pending_delete).ok_or(Error::NotFound)?;
+        let summary = summarize(store, &memo)?;
+        let payload = shown(&memo);
+        let own = summary.owner_id == user_id;
+        let vault = store.vault()?;
+        let vault = vault.as_ref().map(|v| v.current());
+        let shared_with = vault.and_then(|v| v.shares.get(&id));
+        let mut members = Vec::new();
+        for member in store.access(id)?.iter().flat_map(|a| &a.members) {
+            let (trust, key) = trust(vault, user_id, member.user_id, &member.username, member.public_key);
+            let pinned_name = vault.and_then(|v| v.contacts.get(&member.user_id)).map(|c| &c.username);
+            members.push(MemberView {
+                user_id: member.user_id,
+                username: pinned_name.filter(|name| !name.is_empty()).unwrap_or(&member.username).clone(),
+                permission: member.permission,
+                trust,
+                fingerprint: fingerprint(member.user_id, &key),
+                unconfirmed: own
+                    && member.user_id != user_id
+                    && !shared_with.is_some_and(|users| users.contains(&member.user_id)),
+            });
+        }
+        let mut attachments: Vec<AttachmentView> = Vec::new();
+        // The other side of a conflict may have images this side does not.
+        let theirs = memo.conflict.iter().flat_map(|c| &c.theirs.attachments);
+        for attachment in payload.iter().flat_map(|p| &p.attachments).chain(theirs) {
+            if attachments.iter().any(|a| a.id == attachment.id) {
+                continue;
+            }
+            let record = store.attachment(attachment.id)?;
+            let cached = |kind| store.blob(attachment.id, kind).map(|b| b.is_some());
+            attachments.push(AttachmentView {
+                id: attachment.id,
+                mime: attachment.mime.clone(),
+                size: attachment.size,
+                width: attachment.width,
+                height: attachment.height,
+                thumb: attachment.thumb.clone(),
+                available: record.as_ref().is_some_and(|r| r.uploaded) || cached(crate::AttachmentKind::Original)?,
+                thumb_available: record.as_ref().is_some_and(|r| r.thumb_uploaded)
+                    || cached(crate::AttachmentKind::Thumbnail)?,
+            });
+        }
+        let mut linked_from: Vec<MemoLink> = self
+            .entries(store)?
+            .iter()
+            .filter(|e| e.summary.id != id && e.links().contains(&id))
+            .map(|e| MemoLink { id: e.summary.id, title: e.summary.title.clone() })
+            .collect();
+        linked_from.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()).then(a.id.cmp(&b.id)));
+        Ok(MemoDetail {
+            linked_from,
+            body: payload.map(|p| p.body.clone()).unwrap_or_default(),
+            edited_at: payload.map_or(0, |p| p.edited_at),
+            server_version: memo.server_version,
+            updated_by: memo.updated_by,
+            own,
+            members,
+            attachments,
+            conflict_with: memo.conflict.as_ref().map(|c| ConflictView {
+                body: c.theirs.body.clone(),
+                version: c.theirs_version,
+                edited_at: c.theirs.edited_at,
+            }),
+            summary,
+        })
+    }
+}
+
+/// [`Views::memo_list`] without keeping anything.
 pub fn memo_list<S: Store>(store: &S, filter: &MemoFilter) -> Result<Vec<MemoSummary>> {
-    let terms: Vec<String> = filter.query.split_whitespace().map(str::to_lowercase).collect();
-    let tag = filter.tag.as_deref().map(str::to_lowercase);
-    let mut list = Vec::new();
-    for (memo, summary) in memos(store)? {
-        if summary.archived != filter.archived
-            || tag.as_ref().is_some_and(|t| !summary.tags.contains(t))
-            || filter.created_from.is_some_and(|from| summary.created_at < from)
-            || filter.created_before.is_some_and(|before| summary.created_at >= before)
-        {
-            continue;
-        }
-        let body = shown(&memo).map_or("", |p| p.body.as_str());
-        if !terms.is_empty() {
-            let body = body.to_lowercase();
-            if !terms.iter().all(|t| body.contains(t.as_str())) {
-                continue;
-            }
-        }
-        if !filter.has.is_empty() {
-            let contents = text::contents(body);
-            if !filter.has.iter().all(|has| has.matches(&contents, summary.images)) {
-                continue;
-            }
-        }
-        list.push(summary);
-    }
-    list.sort_by(|a, b| b.pinned.cmp(&a.pinned).then(b.updated_at.cmp(&a.updated_at)).then(b.id.cmp(&a.id)));
-    Ok(list)
+    Views::new().memo_list(store, filter)
 }
 
-/// Every memo the UI can show, with its summary.
-fn memos<S: Store>(store: &S) -> Result<Vec<(MemoRecord, MemoSummary)>> {
-    let mut memos = Vec::new();
-    for id in store.memo_ids()? {
-        if let Some(memo) = store.memo(id)?.filter(|m| !m.pending_delete) {
-            let summary = summarize(store, &memo)?;
-            memos.push((memo, summary));
-        }
-    }
-    Ok(memos)
-}
-
-/// When the memos in the main list (not archived) were created, oldest first, for a calendar.
+/// [`Views::activity`] without keeping anything.
 pub fn activity<S: Store>(store: &S) -> Result<Vec<i64>> {
-    let mut times: Vec<i64> =
-        memos(store)?.into_iter().filter(|(_, s)| !s.archived).map(|(_, s)| s.created_at).collect();
-    times.sort_unstable();
-    Ok(times)
+    Views::new().activity(store)
 }
 
+/// [`Views::stats`] without keeping anything.
 pub fn stats<S: Store>(store: &S) -> Result<Stats> {
-    let mut stats = Stats::default();
-    let mut tags = std::collections::BTreeSet::new();
-    for (memo, summary) in memos(store)? {
-        if summary.archived {
-            stats.archived += 1;
-            continue;
-        }
-        let contents = text::contents(shown(&memo).map_or("", |p| p.body.as_str()));
-        stats.memos += 1;
-        stats.words += contents.words;
-        stats.images += summary.images;
-        stats.open_tasks += contents.open_tasks;
-        stats.done_tasks += contents.done_tasks;
-        stats.shared += usize::from(summary.shared);
-        stats.since = Some(stats.since.map_or(summary.created_at, |s| s.min(summary.created_at)));
-        tags.extend(summary.tags);
-    }
-    stats.tags = tags.len();
-    Ok(stats)
+    Views::new().stats(store)
 }
 
 /// The saved filters from the vault, by name.
@@ -279,100 +427,43 @@ pub fn saved_filters<S: Store>(store: &S) -> Result<Vec<SavedFilter>> {
     Ok(filters)
 }
 
-/// Tags of the memos in the main list (not archived), most used first.
+/// [`Views::tag_counts`] without keeping anything.
 pub fn tag_counts<S: Store>(store: &S) -> Result<Vec<TagCount>> {
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for summary in memo_list(store, &MemoFilter::default())? {
-        for tag in summary.tags {
-            *counts.entry(tag).or_default() += 1;
-        }
-    }
-    let mut tags: Vec<TagCount> = counts.into_iter().map(|(tag, count)| TagCount { tag, count }).collect();
-    tags.sort_by(|a, b| b.count.cmp(&a.count).then(a.tag.cmp(&b.tag)));
-    Ok(tags)
+    Views::new().tag_counts(store)
 }
 
+/// [`Views::memo_detail`] without keeping anything.
 pub fn memo_detail<S: Store>(store: &S, user_id: Uuid, id: Uuid) -> Result<MemoDetail> {
-    let memo = store.memo(id)?.filter(|m| !m.pending_delete).ok_or(Error::NotFound)?;
-    let summary = summarize(store, &memo)?;
-    let payload = shown(&memo);
-    let access = store.access(id)?;
-    let mut members = Vec::new();
-    for member in access.iter().flat_map(|a| &a.members) {
-        let (trust, key) = trust(store, user_id, member.user_id, member.public_key)?;
-        members.push(MemberView {
-            user_id: member.user_id,
-            username: member.username.clone(),
-            permission: member.permission,
-            trust,
-            fingerprint: fingerprint(member.user_id, &key),
-        });
-    }
-    let mut attachments: Vec<AttachmentView> = Vec::new();
-    // The other side of a conflict may have images this side does not.
-    let theirs = memo.conflict.iter().flat_map(|c| &c.theirs.attachments);
-    for attachment in payload.iter().flat_map(|p| &p.attachments).chain(theirs) {
-        if attachments.iter().any(|a| a.id == attachment.id) {
-            continue;
-        }
-        let record = store.attachment(attachment.id)?;
-        let cached = |kind| store.blob(attachment.id, kind).map(|b| b.is_some());
-        attachments.push(AttachmentView {
-            id: attachment.id,
-            mime: attachment.mime.clone(),
-            size: attachment.size,
-            width: attachment.width,
-            height: attachment.height,
-            thumb: attachment.thumb.clone(),
-            available: record.as_ref().is_some_and(|r| r.uploaded) || cached(crate::AttachmentKind::Original)?,
-            thumb_available: record.as_ref().is_some_and(|r| r.thumb_uploaded)
-                || cached(crate::AttachmentKind::Thumbnail)?,
-        });
-    }
-    let mut linked_from = Vec::new();
-    for other in store.memo_ids()? {
-        let Some(other) = store.memo(other)?.filter(|m| !m.pending_delete && m.id != id) else { continue };
-        if shown(&other).is_some_and(|p| text::linked_memos(&p.body).contains(&id)) {
-            linked_from.push(MemoLink { id: other.id, title: text::title(shown(&other).map_or("", |p| &p.body)) });
-        }
-    }
-    linked_from.sort_by(|a, b| a.title.to_lowercase().cmp(&b.title.to_lowercase()).then(a.id.cmp(&b.id)));
-    Ok(MemoDetail {
-        linked_from,
-        body: payload.map(|p| p.body.clone()).unwrap_or_default(),
-        edited_at: payload.map_or(0, |p| p.edited_at),
-        server_version: memo.server_version,
-        updated_by: memo.updated_by,
-        own: memo.owner_id == user_id,
-        members,
-        attachments,
-        conflict_with: memo.conflict.as_ref().map(|c| ConflictView {
-            body: c.theirs.body.clone(),
-            version: c.theirs_version,
-            edited_at: c.theirs.edited_at,
-        }),
-        summary,
-    })
+    Views::new().memo_detail(store, user_id, id)
 }
 
 /// How far the key a server presents for `user_id` can be trusted, and the key to show the
 /// fingerprint of. For the share dialog, before anything is pinned.
 pub fn contact_trust<S: Store>(store: &S, user_id: Uuid, user: &UserInfo) -> Result<(Trust, String)> {
-    let (trust, key) = trust(store, user_id, user.user_id, user.public_key)?;
+    let vault = store.vault()?;
+    let vault = vault.as_ref().map(|v| v.current());
+    let (trust, key) = trust(vault, user_id, user.user_id, &user.username, user.public_key);
     Ok((trust, fingerprint(user.user_id, &key)))
 }
 
-fn trust<S: Store>(store: &S, me: Uuid, user_id: Uuid, presented: PublicKey) -> Result<(Trust, PublicKey)> {
+fn trust(
+    vault: Option<&VaultPayload>,
+    me: Uuid,
+    user_id: Uuid,
+    username: &str,
+    presented: PublicKey,
+) -> (Trust, PublicKey) {
     if user_id == me {
-        return Ok((Trust::Me, presented));
+        return (Trust::Me, presented);
     }
-    let contact = store.vault()?.and_then(|v| v.current().contacts.get(&user_id).cloned());
-    Ok(match contact {
-        None => (Trust::NotPinned, presented),
+    match vault.and_then(|v| v.contacts.get(&user_id)) {
         Some(c) if c.public_key != presented => (Trust::Changed, c.public_key),
         Some(c) if c.verified => (Trust::Verified, c.public_key),
         Some(c) => (Trust::Pinned, c.public_key),
-    })
+        // A pinned name under another user id is not the account that was pinned.
+        None if vault.is_some_and(|v| ops::name_taken(v, user_id, username)) => (Trust::Changed, presented),
+        None => (Trust::NotPinned, presented),
+    }
 }
 
 /// Decrypts a revision from `GET /memos/{id}/revisions/{version}` with the cached key.
@@ -398,13 +489,17 @@ fn summarize<S: Store>(store: &S, memo: &MemoRecord) -> Result<MemoSummary> {
         && memo.undecoded.as_ref().is_none_or(|u| u.reason != UndecodedReason::NewerFormat);
     Ok(MemoSummary {
         id: memo.id,
-        owner_id: memo.owner_id,
+        // The access record's owner is the one the wrapped keys verify.
+        owner_id: access.as_ref().map_or(memo.owner_id, |a| a.owner_id),
         title: text::title(body),
         preview: text::preview(body),
         tags: text::tags(body),
         pinned: state.as_ref().is_some_and(|s| s.pinned),
         archived: state.as_ref().is_some_and(|s| s.archived),
-        shared: access.as_ref().is_some_and(|a| a.members.iter().any(|m| m.user_id != memo.owner_id)),
+        // Someone besides the owner is listed, or the list leaves the owner out.
+        shared: access.as_ref().is_some_and(|a| {
+            a.members.iter().any(|m| m.user_id != a.owner_id) || a.members.iter().all(|m| m.user_id != a.owner_id)
+        }),
         writable,
         created_at: memo.created_at,
         updated_at: memo.updated_at.max(memo.local.as_ref().map_or(0, |p| p.edited_at)),

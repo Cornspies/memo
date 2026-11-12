@@ -207,7 +207,16 @@ impl SyncSession {
             // The vault first, so contact pins are known before access entities are verified.
             let (vaults, others): (Vec<_>, Vec<_>) =
                 response.changes.into_iter().partition(|c| matches!(c, Change::Vault(_)));
-            for change in vaults.into_iter().chain(others) {
+            for change in vaults {
+                self.apply_change(store, account, change)?;
+            }
+            // Every account has a vault, and a full sync starts with it. Without it there are no
+            // pins to check the members' keys against.
+            let grants_access = |c: &Change| matches!(c, Change::Access(a) if !a.revoked);
+            if others.iter().any(grants_access) && store.vault()?.is_none() {
+                return Err(Error::Malformed("sync response without the vault"));
+            }
+            for change in others {
                 self.apply_change(store, account, change)?;
             }
             let mut meta = store.meta()?;
@@ -301,7 +310,7 @@ impl SyncSession {
             }
             if memo.pending_delete {
                 if memo.server_version == 0 {
-                    ops::remove_memo_locally(store, id)?;
+                    self.again |= ops::remove_memo_locally(store, id)?;
                 } else {
                     ops.push(PushOp::MemoDelete { id, base_version: memo.server_version });
                     pending.push(Pending::MemoDelete { id });
@@ -314,14 +323,14 @@ impl SyncSession {
             let version = memo.server_version + 1;
             let ctx = MemoContext { memo_id: id, version, key_version: memo.key_version };
             let ciphertext = seal_memo(key, &ctx, &local)?;
-            let wrapped_key = (memo.server_version == 0).then(|| {
+            let wrapped_key = if memo.server_version == 0 {
                 let grant =
                     KeyGrant { memo_id: id, key_version: 1, owner_id: account.user_id, member_id: account.user_id };
-                wrap_memo_key(&account.keypair, account.keypair.public_key(), &grant, key)
-            });
-            if wrapped_key.is_some() {
                 created.insert(id);
-            }
+                Some(wrap_memo_key(&account.keypair, account.keypair.public_key(), &grant, key)?)
+            } else {
+                None
+            };
             memo.in_flight = Some(InFlight::record(memo.in_flight.take(), version, local.clone()));
             store.put_memo(&memo)?;
             ops.push(PushOp::MemoPut {
@@ -400,7 +409,9 @@ impl SyncSession {
                 self.report.push(SyncEvent::PushRejected { memo_id: id, reason });
             }
             Pending::MemoDelete { id } => match result.status {
-                OpStatus::Ok | OpStatus::Deleted | OpStatus::NotFound => ops::remove_memo_locally(store, id)?,
+                OpStatus::Ok | OpStatus::Deleted | OpStatus::NotFound => {
+                    self.again |= ops::remove_memo_locally(store, id)?;
+                }
                 OpStatus::Conflict | OpStatus::Forbidden | OpStatus::Invalid | OpStatus::QuotaExceeded => {
                     if let Some(mut memo) = store.memo(id)? {
                         memo.pending_delete = false;
@@ -460,9 +471,11 @@ impl SyncSession {
         }
         let ciphertext = change.ciphertext.ok_or(Error::Malformed("memo change without ciphertext"))?;
         let resetting = self.seen.is_some();
+        let verified_owner = store.access(change.id)?.map(|a| a.owner_id);
         let mut memo = existing.unwrap_or_else(|| MemoRecord {
             id: change.id,
-            // The owner never changes; a record keeps the first one it saw.
+            // Only what the server says. The access record's owner, which the wrapped keys verify,
+            // replaces it.
             owner_id: change.owner_id,
             server_version: 0,
             key_version: change.key_version,
@@ -478,6 +491,9 @@ impl SyncSession {
             updated_at: change.updated_at,
             updated_by: change.updated_by,
         });
+        if let Some(owner) = verified_owner {
+            memo.owner_id = owner;
+        }
         if !resetting {
             if change.version < memo.highest_seen_version {
                 let highest_seen = memo.highest_seen_version;
@@ -607,7 +623,7 @@ impl SyncSession {
         if change.revoked {
             match store.memo(memo_id)? {
                 Some(memo) => self.lose_memo(store, account, memo, CopyReason::AccessRevoked)?,
-                None => ops::remove_memo_locally(store, memo_id)?,
+                None => self.again |= ops::remove_memo_locally(store, memo_id)?,
             }
             return Ok(());
         }
@@ -629,12 +645,12 @@ impl SyncSession {
                 if member.public_key != own_key {
                     self.report.push(SyncEvent::KeyChanged { user_id: member.user_id });
                 }
-                own_key
+                Some(own_key)
             } else {
                 self.check_pin(store, member.user_id, &member.username, member.public_key)?
             };
             if member.user_id == access.owner_id {
-                owner_key = Some(key);
+                owner_key = key;
             }
         }
         let owner_key = match owner_key {
@@ -664,9 +680,13 @@ impl SyncSession {
         store.put_access(&access)?;
 
         if let Some(mut memo) = store.memo(memo_id)? {
-            if permission == Permission::Write && memo.push_error == Some(PushError::Forbidden) {
+            let regained = permission == Permission::Write && memo.push_error == Some(PushError::Forbidden);
+            if regained {
                 memo.push_error = None;
                 self.again |= memo.is_dirty();
+            }
+            if regained || memo.owner_id != access.owner_id {
+                memo.owner_id = access.owner_id;
                 store.put_memo(&memo)?;
             }
             if memo.undecoded.is_some() {
@@ -676,25 +696,30 @@ impl SyncSession {
         Ok(())
     }
 
-    /// Returns the key to trust for `user_id`: the pinned one.
+    /// Returns the key to trust for `user_id`: the pinned one, or none for a name that is pinned
+    /// under another user id.
     fn check_pin<S: Store>(
         &mut self,
         store: &mut S,
         user_id: Uuid,
         username: &str,
         presented: PublicKey,
-    ) -> Result<PublicKey> {
-        match ops::check_pin(store, user_id, username, presented, self.now)? {
-            PinCheck::Matches | PinCheck::Unavailable => Ok(presented),
+    ) -> Result<Option<PublicKey>> {
+        Ok(match ops::check_pin(store, user_id, username, presented, self.now)? {
+            PinCheck::Matches | PinCheck::Unavailable => Some(presented),
             PinCheck::Pinned => {
                 self.again = true;
-                Ok(presented)
+                Some(presented)
             }
             PinCheck::Changed(pinned) => {
                 self.report.push(SyncEvent::KeyChanged { user_id });
-                Ok(pinned)
+                Some(pinned)
             }
-        }
+            PinCheck::NameTaken => {
+                self.report.push(SyncEvent::KeyChanged { user_id });
+                None
+            }
+        })
     }
 
     fn apply_attachment<S: Store>(&mut self, store: &mut S, change: AttachmentChange) -> Result<()> {
@@ -770,12 +795,13 @@ impl SyncSession {
         store.put_vault(&vault)
     }
 
-    /// Turns a memo the restored server does not know back into an unsynced one with the same id
-    /// and `memo_key[1]`. Sharing is lost with the server's data; attachments are uploaded again.
+    /// Turns a memo the restored server does not know back into an unsynced one with the same id.
+    /// Its newest key becomes `memo_key[1]`: the old one is known to every member revoked since.
+    /// Sharing is lost with the server's data; attachments are uploaded again.
     fn recreate<S: Store>(&mut self, store: &mut S, account: &UnlockedAccount, mut memo: MemoRecord) -> Result<bool> {
         let Some(mut access) = store.access(memo.id)? else { return Ok(false) };
         let (Some(content), Some(key)) =
-            (memo.current().filter(|p| p.is_editable()).cloned(), access.keys.get(&1).cloned())
+            (memo.current().filter(|p| p.is_editable()).cloned(), access.keys.values().next_back().cloned())
         else {
             return Ok(false);
         };
@@ -805,6 +831,7 @@ impl SyncSession {
         }
         store.put_access(&access)?;
         store.put_memo(&memo)?;
+        ops::forget_shares(store, memo.id, None)?;
         self.report.push(SyncEvent::ServerLostData { memo_id: memo.id });
         Ok(true)
     }
@@ -824,7 +851,8 @@ impl SyncSession {
             self.report.push(SyncEvent::RestoredCopy { original: memo.id, copy, reason });
             self.again = true;
         }
-        ops::remove_memo_locally(store, memo.id)
+        self.again |= ops::remove_memo_locally(store, memo.id)?;
+        Ok(())
     }
 
     /// Everything the full resync did not return is gone from the server. After a restore, our own
@@ -842,7 +870,8 @@ impl SyncSession {
                 continue;
             }
             let Some(memo) = store.memo(id)?.filter(|m| m.server_version > 0) else { continue };
-            if restored && memo.owner_id == account.user_id && self.recreate(store, account, memo.clone())? {
+            let own = ops::owner_of(store, &memo)? == account.user_id;
+            if restored && own && self.recreate(store, account, memo.clone())? {
                 continue;
             }
             self.lose_memo(store, account, memo, CopyReason::Deleted)?;

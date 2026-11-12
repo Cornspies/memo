@@ -191,6 +191,10 @@ pub trait Store {
     fn commit(&mut self) -> Result<()>;
     fn rollback(&mut self);
 
+    /// A number that changes whenever a memo, access record or state may have changed. The read
+    /// models ([`Views`](super::Views)) keep what they computed until it does.
+    fn generation(&self) -> u64;
+
     fn meta(&self) -> Result<SyncMeta>;
     fn set_meta(&mut self, meta: &SyncMeta) -> Result<()>;
 

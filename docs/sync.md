@@ -35,7 +35,7 @@ recorded for **every user who can see the entity**:
 | Entity | Fanned out to |
 |---|---|
 | `memo` | all members |
-| `access` (keys and member list of a memo) | all members, plus a user who just lost access |
+| `access` (keys and member list of a memo) | all members, plus a user who just lost access (revoked or left) |
 | `attachment` | all members |
 | `state` (pinned/archived) | that user only |
 | `vault` | that user only |
@@ -43,6 +43,10 @@ recorded for **every user who can see the entity**:
 Writing an entity **replaces** its earlier change-log row for that user (delete + insert), so the log
 holds just one row per entity a user can see. Sync returns the **current** state of each changed
 entity, never the history.
+
+A user who loses access to a memo keeps only its `access` row, which then renders as revoked. Their
+`memo`, `attachment` and `state` rows for it are removed, and sync never renders a live memo or its
+attachments for a user who is not a member.
 
 Tombstones (deleted memos and attachments, revoked access) stay in the log for 90 days and are then
 purged. For each user the server keeps `purged_through`, the highest `seq` it has removed for them.
@@ -99,7 +103,8 @@ differs.
   `cursor` and an empty `push`.
 - When `cursor` is 0, the first page **starts with the `vault` entity**, wherever its `seq` falls, so a
   new device knows its contact pins before it verifies any wrapped key. The page's `cursor` ignores
-  that out-of-order entry, and the vault may come again later at its own `seq`.
+  that out-of-order entry, and the vault may come again later at its own `seq`. A client that has no
+  vault yet refuses a response with `access` entities in it, instead of pinning keys it cannot check.
 - A client's own successful writes also come back in `changes`. Clients skip entries whose version they
   already hold.
 - `reset: true` is sent if `0 < cursor < purged_through`, if the request's `epoch` differs from the
@@ -252,10 +257,15 @@ if the user kept editing. Without this, typing after a lost response would confl
 1. `revoked: true`: handle as *Access revoked* below.
 2. For every entry in `members` (other than the user), compare `public_key` with the pin in the vault.
    No pin: pin it now (trust on first use; the vault becomes dirty). A different pin: keep using the
-   pinned key and raise the key-change alarm. For the user's own entry, the key must equal their own.
+   pinned key and raise the key-change alarm. A username that is already pinned under another user id
+   is not pinned and raises the same alarm. For the user's own entry, the key must equal their own.
 3. Open each `wrapped_key` not already held with HPKE auth mode, using the **pinned** key of
    `owner_id`. A key that fails is not stored, and the user sees a warning naming the owner.
 4. Store the permission, members and keys, then retry the memo if it was waiting for a key.
+
+The owner of a memo is the `owner_id` of its `access` entity: the wrapped keys only open for that
+owner. The `owner_id` of the `memo` entity is not authenticated and only used until the access
+entity is there.
 
 ### Merge rules
 
@@ -267,6 +277,8 @@ if the user kept editing. Without this, typing after a lost response would confl
 - Vault `contacts`: union. If the two sides pin different keys for the same user, that's the
   key-change alarm from [crypto.md](crypto.md#contact-keys-trust-on-first-use); the older pin is kept.
   `verified` is true if either side verified the **same** key.
+- Vault `shares`: per memo, a three-way set merge. A user stays if both sides have them or one side
+  added them, and goes if one side removed them.
 - Vault `settings`: per key, like `body` but without conflicts: theirs wins if both sides changed a key.
 
 ## Special cases
@@ -296,9 +308,11 @@ When the response has `reset: true`, the client runs a full resync:
 3. Local entities that are not in the full set:
    - Memos never pushed (`server_version = 0`) and attachments not uploaded yet stay.
    - If the reset came with a **new epoch** (`memo-server restore`), the server lost them. The user's
-     own memos are created again with the same id and `memo_key[1]`, as a `memo.put` with
-     `base_version = 0`, and their cached blobs are uploaded again. Sharing must be redone. Memos owned
-     by others are handled like deleted ones.
+     own memos are created again with the same id, as a `memo.put` with `base_version = 0`, and their
+     cached blobs are uploaded again. The **newest** memo key the device holds becomes the new
+     `memo_key[1]`: the old `memo_key[1]` is known to every member revoked since. Sharing must be
+     redone, and the memo's `shares` record is dropped. Memos owned by others are handled like
+     deleted ones.
    - Otherwise (same epoch: offline for longer than the tombstone retention) they were deleted. Clean
      ones are removed; dirty ones are handled as in *Special cases*.
 

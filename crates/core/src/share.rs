@@ -39,8 +39,14 @@ impl KeyGrant {
     }
 }
 
-/// Run by the memo owner. `owner` must be the key pair of `grant.owner_id`.
-pub fn wrap_memo_key(owner: &UserKeyPair, member_key: &PublicKey, grant: &KeyGrant, memo_key: &MemoKey) -> Vec<u8> {
+/// Run by the memo owner. `owner` must be the key pair of `grant.owner_id`. Fails for a member key
+/// that is a low-order point.
+pub fn wrap_memo_key(
+    owner: &UserKeyPair,
+    member_key: &PublicKey,
+    grant: &KeyGrant,
+    memo_key: &MemoKey,
+) -> Result<Vec<u8>> {
     wrap_memo_key_with_rng(owner, member_key, grant, memo_key, &mut os_rng())
 }
 
@@ -50,7 +56,7 @@ pub(crate) fn wrap_memo_key_with_rng(
     grant: &KeyGrant,
     memo_key: &MemoKey,
     rng: &mut impl CryptoRng,
-) -> Vec<u8> {
+) -> Result<Vec<u8>> {
     let mode = OpModeS::<Kem>::Auth((owner.hpke_secret().clone(), owner.public_key().to_hpke()));
     let (enc, ct) = hpke::single_shot_seal_with_rng::<ChaCha20Poly1305, HkdfSha256, Kem>(
         &mode,
@@ -60,12 +66,12 @@ pub(crate) fn wrap_memo_key_with_rng(
         &[],
         rng,
     )
-    .expect("HPKE seal with a valid X25519 key cannot fail");
+    .map_err(|_| Error::Malformed("public key"))?;
     let mut wrapped = Vec::with_capacity(WRAPPED_KEY_LEN);
     wrapped.push(FORMAT_V1);
     wrapped.extend_from_slice(&enc.to_bytes());
     wrapped.extend_from_slice(&ct);
-    wrapped
+    Ok(wrapped)
 }
 
 /// Run by a member. `owner_key` must be the **pinned** public key of `grant.owner_id`; this is
@@ -138,7 +144,7 @@ mod tests {
     #[test]
     fn member_unwraps_owner_key() {
         let s = setup();
-        let wrapped = wrap_memo_key(&s.owner, s.member.public_key(), &s.grant, &s.memo_key);
+        let wrapped = wrap_memo_key(&s.owner, s.member.public_key(), &s.grant, &s.memo_key).unwrap();
         assert_eq!(wrapped.len(), WRAPPED_KEY_LEN);
         let unwrapped = unwrap_memo_key(&s.member, s.owner.public_key(), &s.grant, &wrapped).unwrap();
         assert_eq!(unwrapped, s.memo_key);
@@ -148,7 +154,7 @@ mod tests {
     fn owner_can_wrap_for_self() {
         let s = setup();
         let grant = KeyGrant { member_id: s.grant.owner_id, ..s.grant };
-        let wrapped = wrap_memo_key(&s.owner, s.owner.public_key(), &grant, &s.memo_key);
+        let wrapped = wrap_memo_key(&s.owner, s.owner.public_key(), &grant, &s.memo_key).unwrap();
         assert_eq!(unwrap_memo_key(&s.owner, s.owner.public_key(), &grant, &wrapped).unwrap(), s.memo_key);
     }
 
@@ -156,14 +162,14 @@ mod tests {
     fn forged_by_someone_else_is_rejected() {
         let s = setup();
         let impostor = UserKeyPair::generate();
-        let forged = wrap_memo_key(&impostor, s.member.public_key(), &s.grant, &MemoKey::generate());
+        let forged = wrap_memo_key(&impostor, s.member.public_key(), &s.grant, &MemoKey::generate()).unwrap();
         assert_eq!(unwrap_memo_key(&s.member, s.owner.public_key(), &s.grant, &forged), Err(Error::Decrypt));
     }
 
     #[test]
     fn grant_context_is_bound() {
         let s = setup();
-        let wrapped = wrap_memo_key(&s.owner, s.member.public_key(), &s.grant, &s.memo_key);
+        let wrapped = wrap_memo_key(&s.owner, s.member.public_key(), &s.grant, &s.memo_key).unwrap();
         for other in [
             KeyGrant { key_version: 3, ..s.grant },
             KeyGrant { memo_id: Uuid::now_v7(), ..s.grant },
@@ -172,6 +178,14 @@ mod tests {
         ] {
             assert_eq!(unwrap_memo_key(&s.member, s.owner.public_key(), &other, &wrapped), Err(Error::Decrypt));
         }
+    }
+
+    #[test]
+    fn low_order_member_key_is_an_error() {
+        let s = setup();
+        let zero = PublicKey::from_bytes(&[0; 32]).unwrap();
+        assert!(!zero.is_usable() && s.member.public_key().is_usable());
+        assert_eq!(wrap_memo_key(&s.owner, &zero, &s.grant, &s.memo_key), Err(Error::Malformed("public key")));
     }
 
     #[test]

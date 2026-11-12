@@ -194,6 +194,8 @@ const MESSAGES: Record<string, string> = {
   recovery_key_invalid: "This recovery key is not valid. Check it for typos.",
   key_changed: "This user's key differs from the one you saw before. Do not share until you have checked it with them.",
   not_pinned: "A member's key is not known on this device yet. Sync and try again.",
+  unknown_member:
+    "The server lists a member you never shared this memo with. Remove them first; they get no key for it.",
   read_only: "You cannot edit this memo.",
   in_conflict: "Resolve the conflict first.",
   not_owner: "Only the owner can do this.",

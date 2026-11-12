@@ -33,6 +33,8 @@ export interface MemberView {
   permission: Permission;
   trust: Trust;
   fingerprint: string;
+  /** On your own memo: the server lists them, but you never shared it with them. */
+  unconfirmed: boolean;
 }
 
 export interface ThumbRef {

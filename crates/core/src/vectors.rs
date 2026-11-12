@@ -251,7 +251,7 @@ fn generate() -> Vectors {
                 member_private_key: member.secret_bytes().to_vec(),
                 member_public_key: *member.public_key(),
                 memo_key: memo_key.as_bytes().to_vec(),
-                wrapped_key: wrap_memo_key_with_rng(&owner, member.public_key(), &grant, &memo_key, rng),
+                wrapped_key: wrap_memo_key_with_rng(&owner, member.public_key(), &grant, &memo_key, rng).unwrap(),
             }
         })
         .collect();

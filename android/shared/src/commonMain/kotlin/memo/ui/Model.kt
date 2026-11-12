@@ -32,6 +32,8 @@ data class MemberView(
     /** `me`, `verified`, `pinned`, `not_pinned` or `changed`. */
     val trust: String,
     val fingerprint: String,
+    /** On your own memo: the server lists them, but you never shared it with them. */
+    val unconfirmed: Boolean = false,
 )
 
 data class ThumbRef(val mime: String, val width: Int, val height: Int)

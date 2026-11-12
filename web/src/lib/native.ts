@@ -3,6 +3,9 @@
 // one IPC command, schedules sync (`docs/sync.md#when-sync-runs`) and keeps the account. Unlike the
 // browser it works offline: everything is local, and sync catches up when the server is reachable.
 //
+// The device token and the account's keys never come here: the Rust side keeps them and adds the
+// token to requests itself (`desktop/src/calls.rs`).
+//
 // The calls are in `desktop/src/calls.rs`; `core` forwards to `crates/native`. In debug builds,
 // `memo-desktop --serve` answers the same calls over HTTP (`?ipc=http`) for the end-to-end test.
 
@@ -64,11 +67,12 @@ export function nativeTransport(): Transport | null {
   return null;
 }
 
-/** `network: …` and `bad_url: …` from `calls.rs` become those codes. */
+/** `network: …`, `bad_url: …` and `locked: …` from `calls.rs` become those codes. */
 function nativeError(message: string): BackendError {
   const [code, rest] = message.split(/: (.*)/s);
   if (code === "network") return new BackendError("network", "The server cannot be reached.");
   if (code === "bad_url") return new BackendError("bad_url", `This is not a server address (${rest}).`);
+  if (code === "locked") return new BackendError("locked", "Unlock first.");
   return new BackendError("native", message);
 }
 
@@ -105,31 +109,24 @@ interface Account {
   me: Me | null;
 }
 
-/** What `crates/native` returns when it opens an account; `secrets` go to the keyring. */
+/** What opening an account returns here. Its keys stay on the Rust side. */
 interface Opened {
   user_id: string;
   fingerprint: string;
-  secrets: unknown;
 }
 
-/** The keyring entry. */
-interface Stored {
-  token: string;
-  secrets: unknown;
-}
-
+/** A sign-in the Rust side holds the token and keys of, until `session_commit`. */
 interface Pending {
   server: string;
   username: string;
-  token: string;
   opened: Opened;
 }
 
 export function nativeBackend(transport: Transport): Backend {
   const listeners: ((event: BackendEvent) => void)[] = [];
   let account: Account | null = null;
-  /** Set while unlocked. */
-  let token: string | null = null;
+  /** The Rust side has a session: the account is open and requests carry its token. */
+  let unlocked = false;
   let fingerprint = "";
   /** After register or recover: open, but the user has not confirmed the recovery key yet. */
   let onboarding: Pending | null = null;
@@ -169,20 +166,22 @@ export function nativeBackend(transport: Transport): Backend {
 
   // ---- HTTP ----
 
-  /** The API on `server` (default: the account's), with this device's token unless `auth` is false. */
+  /**
+   * The API, with this device's token unless `auth` is false. `server` is for signing in; once
+   * signed in, the Rust side only talks to the account's server.
+   */
   async function http(
     method: string,
     path: string,
     body?: unknown,
     options: { server?: string; auth?: boolean } = {},
   ): Promise<Uint8Array> {
-    const server = options.server ?? account?.server;
-    if (!server) throw new BackendError("locked", "Sign in first.");
     const raw = body instanceof Uint8Array;
     const request = {
       method,
-      url: `${server}/api/v1${path}`,
-      token: options.auth === false ? null : token,
+      path,
+      server: options.server ?? null,
+      auth: options.auth !== false,
       type: body === undefined ? null : raw ? "application/octet-stream" : "application/json",
     };
     const data = body === undefined ? undefined : raw ? body : encoder.encode(JSON.stringify(body));
@@ -209,9 +208,8 @@ export function nativeBackend(transport: Transport): Backend {
     return (bytes.length ? JSON.parse(decoder.decode(bytes)) : undefined) as T;
   }
 
-  function api(): string {
-    if (!token) throw new BackendError("locked", "Unlock first.");
-    return token;
+  function api() {
+    if (!unlocked) throw new BackendError("locked", "Unlock first.");
   }
 
   // ---- Session ----
@@ -221,22 +219,17 @@ export function nativeBackend(transport: Transport): Backend {
     deviceName = (await ipcJson<{ device: string }>("info")).device;
     account = await ipcJson<Account | null>("account_get");
     if (!account) return;
-    const stored = await ipcJson<string | null | { unavailable: string }>("secrets_get");
-    if (typeof stored !== "string") return;
-    try {
-      const saved: Stored = JSON.parse(stored);
-      const opened = await coreValue<Opened>("open", { secrets: saved.secrets });
-      token = saved.token;
-      fingerprint = opened.fingerprint;
-      void runSync();
-    } catch {
-      // Unreadable keys: unlock with the password.
-    }
+    // Without stored keys (no keyring, or locked): unlock with the password.
+    const restored = await ipcJson<Opened | { unavailable: string } | null>("session_restore");
+    if (!restored || !("fingerprint" in restored)) return;
+    unlocked = true;
+    fingerprint = restored.fingerprint;
+    void runSync();
   })();
 
   function currentSession(): Session {
     if (!account) return { state: "signed_out" };
-    if (!token) return { state: "locked", username: account.username };
+    if (!unlocked) return { state: "locked", username: account.username };
     const me: Me = account.me ?? {
       user_id: account.user_id,
       username: account.username,
@@ -249,16 +242,15 @@ export function nativeBackend(transport: Transport): Backend {
     return { state: "unlocked", me, fingerprint };
   }
 
-  async function signIn({ server, username, token: next, opened }: Pending) {
-    token = next;
+  async function signIn({ server, username, opened }: Pending) {
+    // The token and keys of this sign-in become the session, and go to the keyring if there is one.
+    await ipc("session_commit");
+    unlocked = true;
     fingerprint = opened.fingerprint;
     account = { server, username: username.trim().toLowerCase(), user_id: opened.user_id, me: null };
     account.me = await json<Me>("GET", "/me").catch(() => null);
     if (account.me) account.username = account.me.username;
     await ipc("account_set", JSON.stringify(account));
-    const stored: Stored = { token: next, secrets: opened.secrets };
-    // Without a keyring the keys stay in memory, and the next start asks for the password.
-    await ipc("secrets_set", JSON.stringify(stored)).catch(() => undefined);
     emit({ type: "session", session: currentSession() });
     void runSync();
   }
@@ -268,9 +260,9 @@ export function nativeBackend(transport: Transport): Backend {
     if (!base) throw new BackendError("bad_url", "Enter the server's address.");
     const prelogin = await json("POST", "/auth/prelogin", { username: username.trim() }, { server: base, auth: false });
     const request = await coreValue("login_start", { password, prelogin, username, device: device() });
-    const response = await json<{ token: string }>("POST", "/auth/login", request, { server: base, auth: false });
+    const response = await json("POST", "/auth/login", request, { server: base, auth: false });
     const opened = await coreValue<Opened>("login_finish", { response });
-    await signIn({ server: base, username, token: response.token, opened });
+    await signIn({ server: base, username, opened });
   }
 
   async function register(username: string, password: string, invite: string, server?: string) {
@@ -282,12 +274,9 @@ export function nativeBackend(transport: Transport): Backend {
       invite,
       device: device(),
     });
-    const response = await json<{ token: string }>("POST", "/auth/register", started.request, {
-      server: base,
-      auth: false,
-    });
+    await json("POST", "/auth/register", started.request, { server: base, auth: false });
     const opened = await coreValue<Opened>("register_finish");
-    onboarding = { server: base, username, token: response.token, opened };
+    onboarding = { server: base, username, opened };
     return started.recovery_key;
   }
 
@@ -302,9 +291,9 @@ export function nativeBackend(transport: Transport): Backend {
       new_password: newPassword,
       device: device(),
     });
-    const done = await json<{ token: string }>("POST", "/auth/recover/complete", completed.request, options);
+    await json("POST", "/auth/recover/complete", completed.request, options);
     const opened = await coreValue<Opened>("recover_finish");
-    onboarding = { server: base, username, token: done.token, opened };
+    onboarding = { server: base, username, opened };
     return completed.recovery_key;
   }
 
@@ -312,13 +301,13 @@ export function nativeBackend(transport: Transport): Backend {
   async function wipe() {
     const userId = account?.user_id;
     clearTimeout(syncTimer);
-    token = null;
+    unlocked = false;
     onboarding = null;
     account = null;
     try {
       await (userId ? core("forget", { user_id: userId }) : core("close"));
     } finally {
-      await ipc("secrets_delete").catch(() => undefined);
+      await ipc("session_clear").catch(() => undefined);
       await ipc("account_delete");
       status = { syncing: false, last: null, error: null, unsynced: false };
       emit({ type: "sync", status });
@@ -328,7 +317,7 @@ export function nativeBackend(transport: Transport): Backend {
 
   /** Signs this device out on the server, if it can be reached. */
   async function serverLogout() {
-    if (token) await http("POST", "/auth/logout").catch(() => undefined);
+    if (unlocked) await http("POST", "/auth/logout").catch(() => undefined);
   }
 
   // ---- Sync ----
@@ -345,7 +334,7 @@ export function nativeBackend(transport: Transport): Backend {
   }
 
   function scheduleSync(delay: number) {
-    if (!token) return;
+    if (!unlocked) return;
     clearTimeout(syncTimer);
     syncTimer = setTimeout(() => void runSync(), delay);
   }
@@ -360,13 +349,13 @@ export function nativeBackend(transport: Transport): Backend {
       do {
         again = false;
         await syncRound();
-      } while (again && token);
+      } while (again && unlocked);
     })().finally(() => (running = null));
     return running;
   }
 
   async function syncRound() {
-    if (!token) return;
+    if (!unlocked) return;
     clearTimeout(syncTimer);
     setStatus({ syncing: true });
     try {
@@ -386,7 +375,7 @@ export function nativeBackend(transport: Transport): Backend {
       setStatus({ error: e instanceof Error ? e.message : String(e) });
       scheduleSync(Math.min(MAX_BACKOFF, 5_000 * 2 ** Math.min(failures - 1, 10)));
     } finally {
-      const unsynced = token ? await coreValue<boolean>("has_unsynced").catch(() => false) : false;
+      const unsynced = unlocked ? await coreValue<boolean>("has_unsynced").catch(() => false) : false;
       setStatus({ syncing: false, unsynced });
     }
   }
@@ -613,9 +602,9 @@ export function nativeBackend(transport: Transport): Backend {
       // The memos stay; unlocking signs in again (`docs/crypto.md`).
       await serverLogout();
       clearTimeout(syncTimer);
-      token = null;
+      unlocked = false;
       await core("close");
-      await ipc("secrets_delete").catch(() => undefined);
+      await ipc("session_clear").catch(() => undefined);
       emit({ type: "session", session: currentSession() });
     },
     passwordProblem: (password) => coreValue<string | null>("password_problem", { password }),

@@ -538,3 +538,257 @@ async fn prelogin_salt(server: &TestServer, username: &str) -> memo_core::Salt {
     let (_, body) = server.call(Method::POST, "/auth/prelogin", None, Some(json!({ "username": username }))).await;
     serde_json::from_value::<PreloginResponse>(body).unwrap().kdf.salt
 }
+
+/// The whole log of a user, as a full sync of a new device gets it.
+async fn full_pull(server: &TestServer, client: &Client) -> Vec<Change> {
+    let (mut changes, mut cursor) = (Vec::new(), 0);
+    loop {
+        let body = json!({ "cursor": cursor });
+        let (status, body) = server.call(Method::POST, "/sync", Some(&client.token), Some(body)).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        let response: SyncResponse = serde_json::from_value(body).unwrap();
+        changes.extend(response.changes);
+        cursor = response.cursor;
+        if !response.more {
+            return changes;
+        }
+    }
+}
+
+async fn revoke(server: &TestServer, owner: &mut Client, id: Uuid, users: &[Uuid]) -> StatusCode {
+    let prepared = client::prepare_revoke(&owner.store, &owner.account, id, users).unwrap();
+    let path = format!("/memos/{id}/revoke");
+    let (status, body) = server.call(Method::POST, &path, Some(&owner.token), Some(json!(prepared.request))).await;
+    if status == StatusCode::OK {
+        client::apply_revoke(&mut owner.store, prepared, serde_json::from_value(body).unwrap()).unwrap();
+    }
+    status
+}
+
+#[tokio::test]
+async fn former_members_are_sent_nothing_of_the_memo() {
+    let server = TestServer::new();
+    let (mut alice, _) = register(&server, "alice").await;
+    let (mut bob, _) = register(&server, "bob").await;
+    let (mut carol, _) = register(&server, "carol").await;
+    let id = alice.create("photo");
+    let new =
+        client::NewAttachment { mime: "image/jpeg".into(), width: 4, height: 3, bytes: b"jpeg bytes", thumbnail: None };
+    let attachment = client::add_attachment(&mut alice.store, id, new).unwrap();
+    alice.sync(&server).await;
+    alice.share(&server, id, "bob", Permission::Read).await;
+    alice.share(&server, id, "carol", Permission::Read).await;
+    alice.sync(&server).await;
+    for member in [&mut bob, &mut carol] {
+        member.sync(&server).await;
+        client::set_memo_state(&mut member.store, id, true, false).unwrap();
+        member.sync(&server).await;
+    }
+
+    // Bob leaves (no key rotation), carol is removed.
+    let (status, _) = server.call(Method::DELETE, &format!("/memos/{id}/members/me"), Some(&bob.token), None).await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    alice.sync(&server).await;
+    assert_eq!(revoke(&server, &mut alice, id, &[carol.account.user_id]).await, StatusCode::OK);
+    alice.sync(&server).await;
+    alice.edit(id, "written after they were gone");
+    alice.sync(&server).await;
+
+    for former in [&bob, &carol] {
+        let changes = full_pull(&server, former).await;
+        let about_the_memo: Vec<&Change> = changes
+            .iter()
+            .filter(|c| match c {
+                Change::Memo(m) => m.id == id,
+                Change::Attachment(a) => a.id == attachment.id,
+                Change::State(s) => s.memo_id == id,
+                Change::Access(a) => a.memo_id == id,
+                Change::Vault(_) => false,
+            })
+            .collect();
+        let [Change::Access(access)] = about_the_memo[..] else { panic!("{}: {about_the_memo:?}", former.username) };
+        assert!(access.revoked);
+    }
+
+    // A row left in the log by an older server is not rendered either.
+    let (memo, user) = (*id.as_bytes(), *bob.account.user_id.as_bytes());
+    server
+        .app
+        .db
+        .write_blocking(|tx| {
+            tx.execute(
+                "INSERT INTO change_log (user_id, entity_type, entity_id, changed_at) VALUES (?1, 'memo', ?2, 0)",
+                rusqlite::params![user, memo],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert!(!full_pull(&server, &bob).await.iter().any(|c| matches!(c, Change::Memo(m) if m.id == id)));
+    assert!(bob.sync(&server).await.is_empty());
+    assert!(bob.store.memo(id).unwrap().is_none());
+    // Members still get everything.
+    let mut alice2 = login(&server, "alice", PASSWORD).await.unwrap();
+    alice2.sync(&server).await;
+    assert_eq!(alice2.body(id), "written after they were gone");
+}
+
+async fn login_from(server: &TestServer, username: &str, auth_key: &memo_core::AuthKey, address: &str) -> StatusCode {
+    let request =
+        LoginRequest { username: username.into(), auth_key: auth_key.clone(), device: device(DeviceKind::Desktop) };
+    let request = Request::post("/api/v1/auth/login")
+        .header(header::CONTENT_TYPE, "application/json")
+        .header("x-forwarded-for", address)
+        .body(Body::from(json!(request).to_string()))
+        .unwrap();
+    server.send(request).await.0
+}
+
+#[tokio::test]
+async fn login_backoff_is_per_address_and_hides_who_exists() {
+    let server = TestServer::new();
+    register(&server, "alice").await;
+    let salt = prelogin_salt(&server, "alice").await;
+    let right = derive_password_keys(PASSWORD, &salt, memo_core::KdfParams::DEFAULT).unwrap().auth_key;
+    let wrong = memo_core::AuthKey::from_bytes(&[7; 32]).unwrap();
+    let (attacker, home) = ("203.0.113.9", "2001:db8:1:2::5");
+
+    let mut statuses = Vec::new();
+    for _ in 0..6 {
+        statuses.push(login_from(&server, "alice", &wrong, attacker).await.as_u16());
+    }
+    assert_eq!(statuses, [401, 401, 401, 401, 401, 429]);
+    // The attacker's address is held back, alice at home is not.
+    assert_eq!(login_from(&server, "Alice", &right, attacker).await, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(login_from(&server, "alice", &right, home).await, StatusCode::OK);
+
+    // A name nobody has answers the same way, so the backoff does not show who exists.
+    let mut statuses = Vec::new();
+    for _ in 0..6 {
+        statuses.push(login_from(&server, "nobody", &wrong, "198.51.100.7").await.as_u16());
+    }
+    assert_eq!(statuses, [401, 401, 401, 401, 401, 429]);
+    // One /64 is one client.
+    for _ in 0..5 {
+        login_from(&server, "alice", &wrong, "2001:db8:9:9::1").await;
+    }
+    assert_eq!(login_from(&server, "alice", &right, "2001:db8:9:9:ffff::2").await, StatusCode::TOO_MANY_REQUESTS);
+    assert_eq!(login_from(&server, "no such name!", &wrong, home).await, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn recovery_is_not_limited_per_account() {
+    let server = TestServer::new();
+    register(&server, "alice").await;
+    // Others' wrong guesses do not use up alice's attempts (each address has its own five an hour).
+    for i in 0..4 {
+        let request = Request::post("/api/v1/auth/recover")
+            .header(header::CONTENT_TYPE, "application/json")
+            .header("x-forwarded-for", format!("203.0.113.{i}"))
+            .body(Body::from(json!({ "username": "alice", "recovery_auth_key": wrong_key() }).to_string()))
+            .unwrap();
+        assert_eq!(server.send(request).await.0, StatusCode::UNAUTHORIZED);
+    }
+    let huge = json!({ "username": "x".repeat(900_000), "recovery_auth_key": wrong_key() });
+    assert_eq!(server.call(Method::POST, "/auth/recover", None, Some(huge)).await.0, StatusCode::UNAUTHORIZED);
+}
+
+fn wrong_key() -> String {
+    memo_core::b64_encode([0u8; 32])
+}
+
+#[tokio::test]
+async fn large_memos_can_be_revoked() {
+    let server = TestServer::new();
+    let (mut alice, _) = register(&server, "alice").await;
+    let (bob, _) = register(&server, "bob").await;
+    let id = alice.create(&"a".repeat(800_000));
+    alice.sync(&server).await;
+    alice.share(&server, id, "bob", Permission::Read).await;
+    alice.sync(&server).await;
+    assert_eq!(revoke(&server, &mut alice, id, &[bob.account.user_id]).await, StatusCode::OK);
+    alice.sync(&server).await;
+    assert_eq!(alice.memo(id).key_version, 2);
+}
+
+#[tokio::test]
+async fn registration_refuses_unusable_public_keys() {
+    let server = TestServer::new();
+    let reg = memo_core::register(PASSWORD).unwrap();
+    let mut request = json!({
+        "invite_code": server.invite(), "user_id": reg.user_id, "username": "mallory",
+        "kdf": KdfConfig { salt: reg.kdf_salt, params: reg.kdf }, "auth_key": reg.auth_key,
+        "recovery_auth_key": reg.recovery_auth_key, "public_key": memo_core::b64_encode([0u8; 32]),
+        "enc_account_key": memo_core::b64_encode(&reg.enc_account_key),
+        "enc_account_key_recovery": memo_core::b64_encode(&reg.enc_account_key_recovery),
+        "enc_private_key": memo_core::b64_encode(&reg.enc_private_key), "vault": memo_core::b64_encode(&reg.vault),
+        "device": device(DeviceKind::Desktop),
+    });
+    let (status, body) = server.call(Method::POST, "/auth/register", None, Some(request.clone())).await;
+    assert_eq!((status, body["error"]["code"].as_str()), (StatusCode::BAD_REQUEST, Some("bad_request")));
+    request["public_key"] = json!(reg.public_key);
+    request["invite_code"] = json!("not an invite");
+    let (status, body) = server.call(Method::POST, "/auth/register", None, Some(request)).await;
+    assert_eq!((status, body["error"]["code"].as_str()), (StatusCode::FORBIDDEN, Some("invite_invalid")));
+}
+
+#[tokio::test]
+async fn quota_counts_what_one_push_stores() {
+    let server = TestServer::new();
+    let (mut alice, _) = register(&server, "alice").await;
+    // A short memo is 297 bytes of ciphertext: two fit, three do not.
+    admin::user_set_quota(&server.app.db, "alice", Some(700)).unwrap();
+    let ids = [alice.create("one"), alice.create("two"), alice.create("three")];
+    let events = alice.sync(&server).await;
+    let [SyncEvent::PushRejected { memo_id: rejected, reason: client::PushError::QuotaExceeded }] = events[..] else {
+        panic!("{events:?}")
+    };
+    let used = |body: Value| body["used_bytes"].as_u64().unwrap();
+    assert_eq!(used(server.call(Method::GET, "/me", Some(&alice.token), None).await.1), 2 * 297);
+    // No room for a blob: refused before its body is read.
+    let stored = *ids.iter().find(|id| **id != rejected).unwrap();
+    let (status, ..) = alice.put_blob(&server, stored, Uuid::now_v7(), "original", vec![0; 500]).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+
+    // A delete in the same push makes room for what comes after it.
+    client::delete_memo(&mut alice.store, &alice.account, stored).unwrap();
+    let events = alice.sync(&server).await;
+    assert!(events.is_empty(), "{events:?}");
+    assert_eq!(alice.memo(rejected).server_version, 1);
+    assert_eq!(used(server.call(Method::GET, "/me", Some(&alice.token), None).await.1), 2 * 297);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn data_files_are_for_the_server_user_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |path: PathBuf| std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
+    let server = TestServer::new();
+    register(&server, "alice").await;
+    assert_eq!(mode(server.dir.clone()), 0o700);
+    assert_eq!(mode(server.dir.join("memo.db")), 0o600);
+    assert_eq!(mode(server.dir.join("memo.db-wal")), 0o600);
+    let backup = std::env::temp_dir().join(format!("memo-backup-{}", Uuid::now_v7()));
+    admin::backup(&server.app.db, &server.dir, &backup).unwrap();
+    assert_eq!((mode(backup.clone()), mode(backup.join("memo.db"))), (0o700, 0o600));
+    std::fs::remove_dir_all(backup).unwrap();
+}
+
+#[tokio::test]
+async fn gc_drops_devices_revoked_long_ago() {
+    let server = TestServer::new();
+    let (alice, _) = register(&server, "alice").await;
+    let second = login(&server, "alice", PASSWORD).await.unwrap();
+    assert_eq!(server.call(Method::POST, "/auth/logout", Some(&second.token), None).await.0, StatusCode::NO_CONTENT);
+    let devices = || {
+        server
+            .app
+            .db
+            .read_blocking(|conn| Ok(conn.query_row("SELECT COUNT(*) FROM devices", [], |r| r.get::<_, i64>(0))?))
+            .unwrap()
+    };
+    jobs::gc(&server.app.db, &server.app.config).unwrap();
+    assert_eq!(devices(), 2, "kept while recent");
+    jobs::gc_at(&server.app.db, &server.app.config, memo_server::db::now_ms() + 91 * 24 * 3600 * 1000).unwrap();
+    assert_eq!(devices(), 1);
+    assert_eq!(server.call(Method::GET, "/me", Some(&alice.token), None).await.0, StatusCode::OK);
+}

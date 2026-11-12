@@ -67,7 +67,8 @@ pub struct PinConflict {
     pub dropped: Contact,
 }
 
-/// Contacts are a union. Settings merge per key; theirs wins when both sides changed a key.
+/// Contacts are a union. Settings merge per key; theirs wins when both sides changed a key. Shares
+/// are a three-way set merge per memo.
 pub fn merge_vault(
     base: &VaultPayload,
     ours: &VaultPayload,
@@ -99,7 +100,29 @@ pub fn merge_vault(
         }
     }
     let settings = merge_settings(&base.settings, &ours.settings, &theirs.settings);
-    (VaultPayload { v: theirs.v.max(ours.v), contacts, settings }, conflicts)
+    let shares = merge_shares(&base.shares, &ours.shares, &theirs.shares);
+    (VaultPayload { v: theirs.v.max(ours.v), contacts, settings, shares }, conflicts)
+}
+
+type Shares = BTreeMap<Uuid, BTreeSet<Uuid>>;
+
+/// A user stays if both sides have them or one side added them, and goes if one side removed them.
+fn merge_shares(base: &Shares, ours: &Shares, theirs: &Shares) -> Shares {
+    let empty = BTreeSet::new();
+    let memos: BTreeSet<&Uuid> = ours.keys().chain(theirs.keys()).collect();
+    memos
+        .into_iter()
+        .filter_map(|memo| {
+            let (b, o, t) = (
+                base.get(memo).unwrap_or(&empty),
+                ours.get(memo).unwrap_or(&empty),
+                theirs.get(memo).unwrap_or(&empty),
+            );
+            let users: BTreeSet<Uuid> =
+                o.union(t).filter(|u| (o.contains(u) && t.contains(u)) || !b.contains(u)).copied().collect();
+            (!users.is_empty()).then_some((*memo, users))
+        })
+        .collect()
 }
 
 fn merge_settings(
@@ -128,6 +151,24 @@ mod tests {
     use super::*;
     use crate::keys::{AttachmentKey, PublicKey};
     use serde_json::json;
+
+    #[test]
+    fn vault_shares_merge_as_sets() {
+        let id = |n: u8| Uuid::from_bytes([n; 16]);
+        let vault = |shares: &[(u8, &[u8])]| VaultPayload {
+            shares: shares.iter().map(|(memo, users)| (id(*memo), users.iter().map(|u| id(*u)).collect())).collect(),
+            ..Default::default()
+        };
+        let base = vault(&[(1, &[10, 11]), (2, &[20])]);
+        // Ours adds 12 to memo 1 and shares memo 3; theirs removes 11 and stops sharing memo 2.
+        let ours = vault(&[(1, &[10, 11, 12]), (2, &[20]), (3, &[30])]);
+        let theirs = vault(&[(1, &[10])]);
+        let (merged, conflicts) = merge_vault(&base, &ours, &theirs);
+        assert!(conflicts.is_empty());
+        assert_eq!(merged.shares, vault(&[(1, &[10, 12]), (3, &[30])]).shares);
+        // Rebased on an older vault (a reset after the server lost data), ours stands.
+        assert_eq!(merge_vault(&base, &theirs, &base).0.shares, theirs.shares);
+    }
 
     fn memo(body: &str, edited_at: i64) -> MemoPayload {
         MemoPayload::new(body, edited_at)

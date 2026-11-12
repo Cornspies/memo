@@ -168,6 +168,11 @@ bytes.
   tmp/
 ```
 
+The server creates `<data_dir>` with mode `0700` and `memo.db` with `0600`: the database holds the
+sharing metadata and what an offline password guess needs (`auth_hash`, `enc_account_key`). Files
+that already exist keep their mode; tighten an older installation by hand
+(`chmod 700 <data_dir>; chmod 600 <data_dir>/memo.db*`).
+
 `secret` is used to derive fake prelogin salts. Blob uploads are streamed to `tmp/` while SHA-256 is
 computed. The file is then fsynced, renamed into `blobs/`, and only then is the database row
 committed. A crash can leave orphan files behind, but never a database row pointing at a missing blob.
@@ -183,7 +188,7 @@ Run hourly, and on demand with `memo-server gc`:
   Tombstones are rows for deleted memos and attachments, and `access`/`state` rows of users who are
   no longer members. Memo rows nobody references any more are then deleted.
 - Remove revisions beyond `revisions_per_memo` (oldest first; the current version is always kept).
-- Remove expired recovery tokens and invites.
+- Remove expired recovery tokens and invites, and devices revoked longer ago than `tombstone_days`.
 
 ## Configuration
 
@@ -256,8 +261,8 @@ An admin **cannot** reset passwords or read memos. The recovery key is the only 
 
 ## Backups
 
-`memo-server backup <dir>` writes a consistent database snapshot (`VACUUM INTO`), copies `secret`,
-and hard-links or copies `blobs/`. All memo content and blobs are ciphertext, so backups can be stored
+`memo-server backup <dir>` writes a consistent database snapshot (`VACUUM INTO`, mode `0600`), copies
+`secret`, and hard-links or copies `blobs/`. All memo content and blobs are ciphertext, so backups can be stored
 off-site without encrypting them again (metadata is still visible, see the threat model).
 
 `memo-server restore <dir>` puts a backup in place and **generates a new `epoch`**, so every client
@@ -267,11 +272,13 @@ runs a reset sync and pushes back any data that is newer than the backup (see
 ## Deployment
 
 The server listens on localhost behind your reverse proxy. The proxy's body size limit must allow the
-largest attachment.
+largest attachment. The server does not compress its responses, so let the proxy do it: the web
+app's WebAssembly shrinks from 3.5 MB to about 1.4 MB with gzip.
 
 Caddy:
 ```
 memo.example.com {
+    encode zstd gzip
     request_body {
         max_size 32MB
     }
@@ -282,6 +289,8 @@ memo.example.com {
 nginx:
 ```nginx
 client_max_body_size 32m;
+gzip on;
+gzip_types text/css text/javascript application/json application/wasm;
 location / {
     proxy_pass http://127.0.0.1:8080;
     proxy_set_header X-Forwarded-For $remote_addr;
@@ -300,6 +309,8 @@ After=network.target
 ExecStart=/usr/local/bin/memo-server serve --config /etc/memo/config.toml
 User=memo
 StateDirectory=memo
+StateDirectoryMode=0700
+UMask=0077
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

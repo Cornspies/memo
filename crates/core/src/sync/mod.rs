@@ -27,5 +27,6 @@ pub use store::{
 };
 pub use view::{
     AttachmentView, ConflictView, Has, MemberView, MemoDetail, MemoFilter, MemoLink, MemoSummary, SavedFilter, Stats,
-    TagCount, Trust, activity, contact_trust, memo_detail, memo_list, open_revision, saved_filters, stats, tag_counts,
+    TagCount, Trust, Views, activity, contact_trust, memo_detail, memo_list, open_revision, saved_filters, stats,
+    tag_counts,
 };

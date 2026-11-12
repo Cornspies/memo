@@ -5,6 +5,7 @@
 //! drops the least recently used, but never one still waiting to be uploaded.
 
 use std::{
+    cell::Cell,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -53,6 +54,9 @@ const SCHEMA_VERSION: i64 = 1;
 
 pub struct SqliteStore {
     conn: Connection,
+    /// Counts writes to memos, access records and states ([`Store::generation`]). This connection
+    /// is the only writer of its file.
+    generation: Cell<u64>,
 }
 
 impl SqliteStore {
@@ -76,7 +80,7 @@ impl SqliteStore {
             SCHEMA_VERSION => {}
             _ => return Err(Error::Store(format!("database schema {version} is newer than this app"))),
         }
-        Ok(Self { conn })
+        Ok(Self { conn, generation: Cell::new(0) })
     }
 
     /// Evicts cached blobs, least recently used first, until they take at most `budget` bytes.
@@ -128,6 +132,12 @@ impl SqliteStore {
         self.conn.prepare_cached(sql).map_err(store)?.execute(params).map_err(store)?;
         Ok(())
     }
+
+    /// A write that the read models depend on.
+    fn change(&self, sql: &str, params: impl rusqlite::Params) -> Result<()> {
+        self.generation.set(self.generation.get() + 1);
+        self.exec(sql, params)
+    }
 }
 
 impl Store for SqliteStore {
@@ -142,6 +152,11 @@ impl Store for SqliteStore {
     fn rollback(&mut self) {
         // Fails only if no transaction is open, and then there is nothing to undo.
         let _ = self.conn.execute_batch("ROLLBACK");
+        self.generation.set(self.generation.get() + 1);
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation.get()
     }
 
     fn meta(&self) -> Result<SyncMeta> {
@@ -161,14 +176,14 @@ impl Store for SqliteStore {
     }
 
     fn put_memo(&mut self, memo: &MemoRecord) -> Result<()> {
-        self.exec(
+        self.change(
             "INSERT OR REPLACE INTO memos (id, dirty, undecoded, data) VALUES (?1, ?2, ?3, ?4)",
             params![&memo.id.as_bytes()[..], memo.is_dirty(), memo.undecoded.is_some(), json(memo)],
         )
     }
 
     fn delete_memo(&mut self, id: Uuid) -> Result<()> {
-        self.exec("DELETE FROM memos WHERE id = ?1", [&id.as_bytes()[..]])
+        self.change("DELETE FROM memos WHERE id = ?1", [&id.as_bytes()[..]])
     }
 
     fn access(&self, memo_id: Uuid) -> Result<Option<AccessRecord>> {
@@ -176,14 +191,14 @@ impl Store for SqliteStore {
     }
 
     fn put_access(&mut self, access: &AccessRecord) -> Result<()> {
-        self.exec(
+        self.change(
             "INSERT OR REPLACE INTO access (memo_id, data) VALUES (?1, ?2)",
             params![&access.memo_id.as_bytes()[..], json(access)],
         )
     }
 
     fn delete_access(&mut self, memo_id: Uuid) -> Result<()> {
-        self.exec("DELETE FROM access WHERE memo_id = ?1", [&memo_id.as_bytes()[..]])
+        self.change("DELETE FROM access WHERE memo_id = ?1", [&memo_id.as_bytes()[..]])
     }
 
     fn state(&self, memo_id: Uuid) -> Result<Option<StateRecord>> {
@@ -195,14 +210,14 @@ impl Store for SqliteStore {
     }
 
     fn put_state(&mut self, state: &StateRecord) -> Result<()> {
-        self.exec(
+        self.change(
             "INSERT OR REPLACE INTO states (memo_id, dirty, data) VALUES (?1, ?2, ?3)",
             params![&state.memo_id.as_bytes()[..], state.dirty, json(state)],
         )
     }
 
     fn delete_state(&mut self, memo_id: Uuid) -> Result<()> {
-        self.exec("DELETE FROM states WHERE memo_id = ?1", [&memo_id.as_bytes()[..]])
+        self.change("DELETE FROM states WHERE memo_id = ?1", [&memo_id.as_bytes()[..]])
     }
 
     fn attachment(&self, id: Uuid) -> Result<Option<AttachmentRecord>> {

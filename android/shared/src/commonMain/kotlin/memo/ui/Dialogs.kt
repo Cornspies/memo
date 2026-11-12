@@ -147,6 +147,7 @@ fun ShareDialog(app: AppState, memo: MemoDetail, onClose: () -> Unit) {
                     if (member.userId == memo.summary.ownerId) Badge("Owner")
                     if (member.trust == "me") Badge("You")
                     TrustBadge(member.trust)
+                    if (member.unconfirmed) Badge("Not added by you", warn = true)
                 }
                 Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(4.dp)) {
                     when {
@@ -170,6 +171,15 @@ fun ShareDialog(app: AppState, memo: MemoDetail, onClose: () -> Unit) {
                         "The server now presents a different key for ${member.username} than the one you saw before. " +
                             "This can mean an attack. Memos are only encrypted to the key you saw first. Ask them " +
                             "whether they reset their account.",
+                        muted = false,
+                    )
+                }
+                if (member.unconfirmed) {
+                    Small(
+                        "The server lists ${member.username} as a member, but your account has no record of sharing " +
+                            "this memo with them. If you just shared it on another device, sync that device and this " +
+                            "one. Otherwise remove them: they have not been given a key by you, and removing them " +
+                            "makes a new one.",
                         muted = false,
                     )
                 }

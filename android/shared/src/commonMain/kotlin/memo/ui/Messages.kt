@@ -70,6 +70,8 @@ private val MESSAGES =
         "key_changed" to
             "This user's key differs from the one you saw before. Do not share until you have checked it with them.",
         "not_pinned" to "A member's key is not known on this device yet. Sync and try again.",
+        "unknown_member" to
+            "The server lists a member you never shared this memo with. Remove them first; they get no key for it.",
         "read_only" to "You cannot edit this memo.",
         "in_conflict" to "Resolve the conflict first.",
         "not_owner" to "Only the owner can do this.",

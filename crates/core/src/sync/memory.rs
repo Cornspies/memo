@@ -1,6 +1,6 @@
 //! An in-memory [`Store`]: the web client's store (online-only) and the one tests use.
 
-use std::collections::BTreeMap;
+use std::{cell::Cell, collections::BTreeMap, sync::Arc};
 
 use uuid::Uuid;
 
@@ -15,19 +15,59 @@ struct Data {
     states: BTreeMap<Uuid, StateRecord>,
     attachments: BTreeMap<Uuid, AttachmentRecord>,
     vault: Option<VaultRecord>,
-    blobs: BTreeMap<(Uuid, AttachmentKind), Vec<u8>>,
+    blobs: BTreeMap<(Uuid, AttachmentKind), Blob>,
 }
 
-/// Transactions snapshot the whole store on `begin`; fine for the sizes a browser tab holds.
+/// An envelope, shared so that a snapshot does not copy the images, and when it was last read.
+#[derive(Clone, Debug)]
+struct Blob {
+    envelope: Arc<[u8]>,
+    used: Cell<u64>,
+}
+
+/// Transactions snapshot the records on `begin`; fine for the sizes a browser tab holds.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryStore {
     data: Data,
     snapshot: Option<Box<Data>>,
+    generation: u64,
+    /// Counts blob reads and writes, to order them by last use.
+    clock: Cell<u64>,
 }
 
 impl MemoryStore {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Evicts cached blobs, least recently used first, until they take at most `budget` bytes.
+    /// Blobs of attachments with a pending upload stay and do not count. Returns the bytes freed.
+    pub fn trim_blobs(&mut self, budget: u64) -> u64 {
+        let attachments = &self.data.attachments;
+        let uploading = |id: &Uuid| attachments.get(id).is_some_and(|a| a.upload_original || a.upload_thumbnail);
+        let mut cached: Vec<_> = self
+            .data
+            .blobs
+            .iter()
+            .filter(|((id, _), _)| !uploading(id))
+            .map(|(key, blob)| (blob.used.get(), *key, blob.envelope.len() as u64))
+            .collect();
+        cached.sort_unstable_by_key(|(used, ..)| std::cmp::Reverse(*used));
+        let (mut kept, mut freed) = (0, 0);
+        for (_, key, size) in cached {
+            if kept + size <= budget {
+                kept += size;
+            } else {
+                self.data.blobs.remove(&key);
+                freed += size;
+            }
+        }
+        freed
+    }
+
+    fn tick(&self) -> u64 {
+        self.clock.set(self.clock.get() + 1);
+        self.clock.get()
     }
 }
 
@@ -46,7 +86,12 @@ impl Store for MemoryStore {
     fn rollback(&mut self) {
         if let Some(snapshot) = self.snapshot.take() {
             self.data = *snapshot;
+            self.generation += 1;
         }
+    }
+
+    fn generation(&self) -> u64 {
+        self.generation
     }
 
     fn meta(&self) -> Result<SyncMeta> {
@@ -68,11 +113,13 @@ impl Store for MemoryStore {
 
     fn put_memo(&mut self, memo: &MemoRecord) -> Result<()> {
         self.data.memos.insert(memo.id, memo.clone());
+        self.generation += 1;
         Ok(())
     }
 
     fn delete_memo(&mut self, id: Uuid) -> Result<()> {
         self.data.memos.remove(&id);
+        self.generation += 1;
         Ok(())
     }
 
@@ -82,11 +129,13 @@ impl Store for MemoryStore {
 
     fn put_access(&mut self, access: &AccessRecord) -> Result<()> {
         self.data.access.insert(access.memo_id, access.clone());
+        self.generation += 1;
         Ok(())
     }
 
     fn delete_access(&mut self, memo_id: Uuid) -> Result<()> {
         self.data.access.remove(&memo_id);
+        self.generation += 1;
         Ok(())
     }
 
@@ -100,11 +149,13 @@ impl Store for MemoryStore {
 
     fn put_state(&mut self, state: &StateRecord) -> Result<()> {
         self.data.states.insert(state.memo_id, state.clone());
+        self.generation += 1;
         Ok(())
     }
 
     fn delete_state(&mut self, memo_id: Uuid) -> Result<()> {
         self.data.states.remove(&memo_id);
+        self.generation += 1;
         Ok(())
     }
 
@@ -137,11 +188,15 @@ impl Store for MemoryStore {
     }
 
     fn blob(&self, id: Uuid, kind: AttachmentKind) -> Result<Option<Vec<u8>>> {
-        Ok(self.data.blobs.get(&(id, kind)).cloned())
+        Ok(self.data.blobs.get(&(id, kind)).map(|blob| {
+            blob.used.set(self.tick());
+            blob.envelope.to_vec()
+        }))
     }
 
     fn put_blob(&mut self, id: Uuid, kind: AttachmentKind, envelope: &[u8]) -> Result<()> {
-        self.data.blobs.insert((id, kind), envelope.to_vec());
+        let blob = Blob { envelope: envelope.into(), used: Cell::new(self.tick()) };
+        self.data.blobs.insert((id, kind), blob);
         Ok(())
     }
 }
