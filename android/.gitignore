@@ -3,3 +3,8 @@
 build/
 local.properties
 app/src/main/jniLibs/
+.idea/
+# Android Studio's "Generate Signed APK" output
+app/release/
+# Written by Android Studio; the README asks for JDK 17 or newer, not a particular one
+gradle/gradle-daemon-jvm.properties

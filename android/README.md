@@ -35,6 +35,28 @@ adb install -r app/build/outputs/apk/debug/app-debug.apk
 Debug builds may use plain HTTP, so the emulator can reach a local `memo-server` at
 `http://10.0.2.2:8080`. Release builds only talk HTTPS.
 
+## Release build
+
+Android only installs an update that is signed with the same key as the installed app, so make the
+key once, outside the repository, and keep it and its password safe:
+
+```sh
+keytool -genkeypair -keystore ~/memo-release.jks -alias memo -keyalg RSA -keysize 4096 -validity 10000
+```
+
+`assembleRelease` signs with it when these are set. Without `MEMO_KEYSTORE` the APK is unsigned and
+does not install. `keytool` uses the keystore's password for the key as well:
+
+```sh
+export MEMO_KEYSTORE=$HOME/memo-release.jks MEMO_KEY_ALIAS=memo
+export MEMO_KEYSTORE_PASSWORD=… MEMO_KEY_PASSWORD=…
+./gradlew assembleRelease               # app/build/outputs/apk/release/app-release.apk
+```
+
+The Release workflow (`../README.md`) does this with the repository secrets
+`ANDROID_KEYSTORE_BASE64` (`base64 -w0 ~/memo-release.jks`), `ANDROID_STORE_PASSWORD`,
+`ANDROID_KEY_ALIAS` and `ANDROID_KEY_PASSWORD`.
+
 ## Dependencies
 
 Versions are exact in `gradle/libs.versions.toml`, and every resolved artifact, transitive ones
@@ -57,6 +79,5 @@ build-rust.sh   libmemo.so into app/src/main/jniLibs (not checked in)
 
 - No automated UI test; the flows were checked by hand on the emulator against a local server and
   the web client (sign-up, offline edits, images, conflicts, sharing, revoking, history, recovery).
-- Release signing is not set up.
 - The app's content is not kept out of screenshots and the recent-apps view (`FLAG_SECURE`).
 - Attachments that cannot be shown inline are not offered for download.

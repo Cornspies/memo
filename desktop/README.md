@@ -52,7 +52,8 @@ The Tauri window itself and the real keyring are not covered: try those by hand.
 
 ## Not done yet
 
-- No packaging (`.desktop` file, icons, AppImage or distribution packages).
+- No packaging (`.desktop` file, icons, AppImage or distribution packages): a release carries the
+  binary, which needs WebKitGTK 4.1 installed.
 - Locking while offline cannot sign the device out on the server; remove it from the device list.
 - Without a Secret Service each start is a new login, so the device list grows.
 - Thumbnails are not prefetched; they download when a memo is shown.

@@ -5,6 +5,10 @@
 set -eu
 cd "$(dirname "$0")"
 NDK=${ANDROID_NDK_HOME:-$HOME/Android/Sdk/ndk/27.3.13750724}
+if [ ! -d "$NDK" ]; then
+  echo "no NDK at $NDK: install NDK 27.3.13750724 (README.md, Toolchain) or set ANDROID_NDK_HOME" >&2
+  exit 1
+fi
 BIN=$NDK/toolchains/llvm/prebuilt/linux-x86_64/bin
 API=30
 

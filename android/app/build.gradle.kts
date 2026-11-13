@@ -3,6 +3,9 @@ plugins {
     alias(libs.plugins.kotlin.compose)
 }
 
+// The release key (README.md, Release build). Without it the release APK is unsigned.
+val keystore = providers.environmentVariable("MEMO_KEYSTORE").orNull
+
 android {
     namespace = "memo.app"
     compileSdk = 37
@@ -17,9 +20,21 @@ android {
         versionName = "0.1.0"
     }
 
+    if (keystore != null) {
+        signingConfigs {
+            create("release") {
+                storeFile = file(keystore)
+                storePassword = providers.environmentVariable("MEMO_KEYSTORE_PASSWORD").get()
+                keyAlias = providers.environmentVariable("MEMO_KEY_ALIAS").get()
+                keyPassword = providers.environmentVariable("MEMO_KEY_PASSWORD").get()
+            }
+        }
+    }
+
     buildTypes {
         release {
             isMinifyEnabled = false
+            signingConfig = signingConfigs.findByName("release")
         }
     }
 }

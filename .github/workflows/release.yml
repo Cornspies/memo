@@ -1,0 +1,213 @@
+# Pushing a tag like v0.2.0 for the version in Cargo.toml tests memo, builds everything that ships
+# and publishes a GitHub release with the files: memo-server (with the web app) and memo-desktop for
+# x86_64 and aarch64 Linux, the signed Android APK, and SHA256SUMS. The release notes are the tagged
+# commit's message, or GitHub's generated notes when the message has no body. A tag with a hyphen
+# (v0.2.0-rc1) becomes a pre-release.
+#
+# Releases are built with the dependencies in the tagged commit's lockfiles (Cargo.lock, bun.lock,
+# gradle.lockfile): the versions that were developed and tested with. The Rust ones are checked
+# against the RustSec advisory database first: a release with a known vulnerability stops there,
+# until Cargo.lock is updated.
+#
+# It needs the repository secrets ANDROID_KEYSTORE_BASE64 (base64 -w0 of the keystore),
+# ANDROID_STORE_PASSWORD, ANDROID_KEY_ALIAS and ANDROID_KEY_PASSWORD (android/README.md).
+#
+# The actions are pinned to commits (the tag is in the comment), so a tag that's moved later can't
+# change what builds a release. Everything else is on the runner image, apart from Bun (pinned
+# below), the latest stable Rust, and Ubuntu's WebKitGTK. The Linux binaries are built on Ubuntu
+# 24.04, so they run with glibc 2.39 or newer.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Check the tag matches the versions
+        run: |
+          tag=${GITHUB_REF_NAME#v}
+          failed=0
+          check() {
+            if [ "$2" != "$tag" ]; then
+              echo "::error file=$1::Tag $GITHUB_REF_NAME doesn't match version $2 in $1"
+              failed=1
+            fi
+          }
+          check Cargo.toml "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[] | select(.name == "memo-server") | .version')"
+          # `cargo check` after changing Cargo.toml updates it; the builds below use --locked.
+          check Cargo.lock "$(sed -n '/^name = "memo-server"$/{n;s/^version = "\(.*\)"$/\1/p}' Cargo.lock)"
+          check desktop/tauri.conf.json "$(jq -r .version desktop/tauri.conf.json)"
+          check android/app/build.gradle.kts "$(sed -n 's/^ *versionName = "\(.*\)"$/\1/p' android/app/build.gradle.kts)"
+          exit $failed
+      - name: Check the Android signing secret
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+        run: |
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            echo "::error::The ANDROID_KEYSTORE_BASE64 secret is not set"
+            exit 1
+          fi
+      - name: Check the dependencies for known vulnerabilities
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit
+
+  # The web app, built once: the server and the desktop app embed it.
+  web:
+    needs: check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup update stable && rustup default stable && rustup target add wasm32-unknown-unknown
+      - name: Install wasm-bindgen
+        # The version of the wasm-bindgen crate (web/README.md).
+        run: cargo install wasm-bindgen-cli --locked --version "$(sed -n 's/^wasm-bindgen = "=\(.*\)"$/\1/p' crates/wasm/Cargo.toml)"
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.4"
+      - name: Build
+        working-directory: web
+        run: |
+          bun install --frozen-lockfile
+          bun run build
+          bun run check
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: web-dist
+          path: web/dist
+          if-no-files-found: error
+
+  test:
+    needs: web
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+      - name: Install WebKitGTK
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libdbus-1-dev
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
+        with:
+          bun-version: "1.4.4"
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: web-dist
+          path: web/dist
+      - name: Unit tests
+        run: cargo test --workspace --locked
+      - name: End-to-end tests
+        run: |
+          cargo build --release --locked -p memo-server
+          cargo build --locked -p memo-desktop
+          cd web
+          bun run e2e
+          bun run e2e:desktop
+
+  build:
+    needs: web
+    strategy:
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-24.04
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+      - name: Install WebKitGTK
+        run: sudo apt-get update && sudo apt-get install -y libwebkit2gtk-4.1-dev libdbus-1-dev
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: web-dist
+          path: web/dist
+      - name: Build
+        # One at a time: built together, the server would get the features the desktop app turns
+        # on in the crates they share.
+        run: |
+          cargo build --release --locked -p memo-server
+          cargo build --release --locked -p memo-desktop
+      - name: Package
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          server=memo-server-${GITHUB_REF_NAME#v}-$ARCH-linux
+          desktop=memo-desktop-${GITHUB_REF_NAME#v}-$ARCH-linux
+          mkdir "$server" "$desktop"
+          cp target/release/memo-server LICENSE docs/server.md "$server"/
+          cp target/release/memo-desktop LICENSE desktop/README.md desktop/icons/icon.png "$desktop"/
+          tar -czf "$server.tar.gz" "$server"
+          tar -czf "$desktop.tar.gz" "$desktop"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: memo-linux-${{ matrix.arch }}
+          path: memo-*.tar.gz
+          if-no-files-found: error
+
+  android:
+    needs: check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup update stable && rustup default stable && rustup target add aarch64-linux-android x86_64-linux-android
+      - name: Build the signed APK
+        working-directory: android
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          MEMO_KEYSTORE: ${{ runner.temp }}/release.jks
+          MEMO_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+          MEMO_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          MEMO_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          # The NDK of build-rust.sh is on the runner image, unless a later image drops it.
+          ndk=$(sed -n 's/^ *ndkVersion = "\(.*\)"$/\1/p' app/build.gradle.kts)
+          export ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$ndk
+          [ -d "$ANDROID_NDK_HOME" ] || "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" "ndk;$ndk"
+          export JAVA_HOME=$JAVA_HOME_25_X64
+          echo "$KEYSTORE_BASE64" | base64 -d > "$MEMO_KEYSTORE"
+          ./gradlew assembleRelease --no-daemon
+          cp app/build/outputs/apk/release/app-release.apk "memo-${GITHUB_REF_NAME#v}.apk"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: memo-android
+          path: android/memo-*.apk
+          if-no-files-found: error
+
+  release:
+    needs: [test, build, android]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          pattern: memo-*
+          path: dist
+          merge-multiple: true
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          (cd dist && sha256sum -- * > SHA256SUMS)
+          git log -1 --format=%b "$GITHUB_REF_NAME^{commit}" > notes.md
+          notes=(--generate-notes)
+          if grep -q '[^[:space:]]' notes.md; then notes=(--notes-file notes.md); fi
+          prerelease=
+          case "$GITHUB_REF_NAME" in *-*) prerelease=--prerelease ;; esac
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --title "$GITHUB_REF_NAME" "${notes[@]}" --verify-tag $prerelease
