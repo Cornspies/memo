@@ -1,0 +1,2 @@
+# Compared byte for byte (crates/core/src/vectors.rs): no CRLF in Windows checkouts.
+docs/test-vectors/*.json text eol=lf
