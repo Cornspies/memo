@@ -1,6 +1,6 @@
 {
   "productName": "memo",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "identifier": "memo.desktop",
   "build": {
     "frontendDist": "../web/dist"
@@ -21,6 +21,6 @@
   },
   "bundle": {
     "active": false,
-    "icon": ["icons/icon.png"]
+    "icon": ["icons/icon.png", "icons/icon.ico"]
   }
 }

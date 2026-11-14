@@ -10,7 +10,12 @@
   import Rendered from "./Rendered.svelte";
   import ShareDialog from "./ShareDialog.svelte";
 
-  let { id, startEditing = false }: { id: string; startEditing?: boolean } = $props();
+  let { id: openedId, startEditing = false }: { id: string; startEditing?: boolean } = $props();
+  // Main keys the pane by memo, so this is its memo for good. The prop reads Main's route, which
+  // is the next memo by the time the cleanup after leaving resumes from an await: discarding an
+  // empty new memo then deleted the memo opened next.
+  // svelte-ignore state_referenced_locally
+  const id = openedId;
 
   const MAX_IMAGE = 25 * 1024 * 1024;
   const SAVE_DELAY = 400;

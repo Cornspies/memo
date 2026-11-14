@@ -1,28 +1,29 @@
-# memo for Linux
+# memo for Linux and Windows
 
 Offline-first, like the Android app: every memo, key and image you open is kept on the computer,
-and sync catches up when the server is reachable (`docs/sync.md`). The window is Tauri (WebKitGTK)
-showing the web UI (`web/`); everything else runs on the Rust side: `memo-core` with its SQLite store
-(`crates/native`, `crates/sqlite`), the HTTP, and the keyring.
+and sync catches up when the server is reachable (`docs/sync.md`). The window is Tauri (WebKitGTK on
+Linux, WebView2 on Windows) showing the web UI (`web/`); everything else runs on the Rust side:
+`memo-core` with its SQLite store (`crates/native`, `crates/sqlite`), the HTTP, and the keyring.
 
 - **Frontend ↔ Rust:** one Tauri command, `call`, with the call's name in the `memo-call` header and
   raw bytes both ways (`src/calls.rs`). The frontend's `NativeBackend` (`web/src/lib/native.ts`)
   implements the same `Backend` as the browser's worker, so the UI is shared.
 - **Keys:** after sign-in, the device token, account key and private key are stored in the Secret
-  Service (GNOME Keyring, KWallet) under service `memo`, user `account`. The app opens without the
-  password. Without a Secret Service the keys stay in memory, and every start asks for the password
-  and needs the server. The token and keys stay on the Rust side: the web view never gets them, so
-  a script that got into it could not carry them off.
+  Service (GNOME Keyring, KWallet) under service `memo`, user `account`, or on Windows in the
+  Credential Manager as `account.memo`. The app opens without the password. Without a Secret
+  Service the keys stay in memory, and every start asks for the password and needs the server. The
+  token and keys stay on the Rust side: the web view never gets them, so a script that got into it
+  could not carry them off.
 - **Lock** removes the keys and signs the device out; the memos stay, and unlocking signs in again.
   **Sign out**, or the server revoking the device, deletes the local copy (`docs/crypto.md`).
 - **HTTP:** `ureq` with rustls and the system's certificates. The webview never talks to the server.
   The Rust side adds the token, and once signed in it only talks to the account's server.
 - **Sync:** on start, on focus, 2 s after an edit, every 5 min, and when the network comes back.
-- **Links** in memos open in the default browser (`xdg-open`, http/https/mailto only). Exports are
-  saved to the Downloads folder.
+- **Links** in memos open in the default browser (`xdg-open`, or Windows' URL handler; http/https/
+  mailto only). Exports are saved to the Downloads folder.
 
-Data lives in `~/.local/share/memo.desktop/` (mode `0700`): `account.json` (server, username; no
-secrets) and `db/<user id>.db`.
+Data lives in `~/.local/share/memo.desktop/` (mode `0700`), on Windows in
+`%LOCALAPPDATA%\memo.desktop\`: `account.json` (server, username; no secrets) and `db/<user id>.db`.
 
 ## Build
 
@@ -34,6 +35,11 @@ compile time, so build it first:
 (cd web && bun run build)
 cargo build --release -p memo-desktop   # target/release/memo-desktop
 ```
+
+On Windows it needs the Visual Studio Build Tools (MSVC) instead of WebKitGTK, and a `web/dist`
+built as above (`bun run build` runs a shell script: use Git Bash, or copy `web/dist` from Linux).
+The result is `target\release\memo-desktop.exe`, one file with the web app and the WebView2 loader
+in it. The release workflow builds it on GitHub (`../README.md`, Release).
 
 ## Test
 
@@ -48,12 +54,16 @@ sign-out.
 (cd web && bun run e2e:desktop)
 ```
 
-The Tauri window itself and the real keyring are not covered: try those by hand.
+The Tauri window itself and the real keyring are not covered: try those by hand. The test runs on
+Linux only; on Windows, the release workflow runs the unit tests of `memo-core`, `memo-sqlite` and
+`memo-native`, and the app is tried by hand.
 
 ## Not done yet
 
-- No packaging (`.desktop` file, icons, AppImage or distribution packages): a release carries the
-  binary, which needs WebKitGTK 4.1 installed.
+- No packaging (`.desktop` file, icons, AppImage, distribution packages or a Windows installer): a
+  release carries the binary, which needs WebKitGTK 4.1 on Linux and the WebView2 runtime on
+  Windows (part of Windows 10 and 11).
+- The Windows `.exe` is not signed: SmartScreen asks before its first start (More info, Run anyway).
 - Locking while offline cannot sign the device out on the server; remove it from the device list.
 - Without a Secret Service each start is a new login, so the device list grows.
 - Thumbnails are not prefetched; they download when a memo is shown.

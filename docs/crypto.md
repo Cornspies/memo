@@ -300,8 +300,9 @@ blocks inline scripts as a second line of defence; Android never uses a web view
 4. The client decrypts the account key, then the private key, and checks the public key matches.
 
 **Unlock without a password (native):** after a login, the device token, `account_key` and private key
-are stored in the OS keystore (Android Keystore-wrapped storage; on Linux the Secret Service via the
-`keyring` crate). If no keystore is available, the client asks for the password at every start.
+are stored in the OS keystore (Android Keystore-wrapped storage; on Linux the Secret Service and on
+Windows the Credential Manager, via `keyring-core`). If no keystore is available, the client asks for
+the password at every start.
 On the desktop, *Lock* signs the device out and deletes the stored keys and token; the local database
 stays, and unlocking is a new login (online) that reopens it. Only signing out deletes it.
 

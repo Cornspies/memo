@@ -321,6 +321,22 @@ try {
   await alice.button("Index", ".backlinks");
   await alice.until(`document.querySelector(".markdown h1")?.innerText === "Index" || document.querySelector("textarea.editor")?.value.startsWith("# Index")`, "back to Index");
   check((await alice.count("textarea.editor")) === 0, "a memo just created opens out of the editor the next time");
+  // Opening another memo from the editor saves (or discards) the memo left, never the one opened.
+  // By title: the preview of Index contains "Snippet".
+  const openTitled = (name: string) =>
+    alice.eval(`[...document.querySelectorAll(".item")].find((i) => i.querySelector(".title").innerText === ${JSON.stringify(name)}).click()`);
+  await alice.button("Edit", ".toolbar");
+  await alice.until(`document.querySelector("textarea.editor")`, "editor");
+  await openTitled("Snippet");
+  await sleep(1000);
+  const untouched = (await alice.text(".markdown h1")) === "Snippet";
+  await alice.button("New memo");
+  await alice.until(`document.querySelector("textarea.editor")`, "editor");
+  await openTitled("Index");
+  await sleep(1000);
+  const kept = (await alice.text(".markdown h1")) === "Index";
+  check(untouched, "leaving the editor for another memo leaves that memo as it was");
+  check(kept, "leaving a new, empty memo for another memo keeps that memo");
 
   check((await alice.text(".items .group")) === "Today", "the list is grouped by day");
   await alice.button("Code", ".quick");

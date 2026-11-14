@@ -10,8 +10,6 @@
 
 use std::{
     fs,
-    io::Read,
-    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
     sync::{Arc, Mutex},
@@ -79,11 +77,19 @@ const OPENING_CALLS: [&str; 4] = ["register_finish", "login_finish", "recover_fi
 impl Ctx {
     pub fn new(data_dir: PathBuf, downloads: PathBuf, secrets: Secrets) -> Result<Arc<Ctx>, String> {
         fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
-        // Decrypted memos and their keys live below it.
-        fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+        // Decrypted memos and their keys live below it. On Windows, the user's AppData is private.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&data_dir, fs::Permissions::from_mode(0o700)).map_err(|e| e.to_string())?;
+        }
         let mut keyring_error = None;
         if matches!(secrets, Secrets::Keyring) {
-            match dbus_secret_service_keyring_store::Store::new() {
+            #[cfg(target_os = "linux")]
+            let store = dbus_secret_service_keyring_store::Store::new();
+            #[cfg(windows)]
+            let store = windows_native_keyring_store::Store::new();
+            match store {
                 Ok(store) => keyring_core::set_default_store(store),
                 Err(e) => keyring_error = Some(e.to_string()),
             }
@@ -333,15 +339,12 @@ fn secrets_delete(ctx: &Ctx) -> Result<(), String> {
 }
 
 fn write_private(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    use std::os::unix::fs::OpenOptionsExt;
     let tmp = path.with_extension("tmp");
-    let mut file = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(&tmp)
-        .map_err(|e| e.to_string())?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+    let mut file = options.open(&tmp).map_err(|e| e.to_string())?;
     std::io::Write::write_all(&mut file, bytes).map_err(|e| e.to_string())?;
     fs::rename(tmp, path).map_err(|e| e.to_string())
 }
@@ -357,8 +360,10 @@ fn account_get(ctx: &Ctx) -> Result<Vec<u8>, String> {
 
 /// The device name the server shows in the device list.
 fn info() -> Value {
-    let mut host = String::new();
-    let _ = fs::File::open("/etc/hostname").and_then(|mut f| f.read_to_string(&mut host));
+    #[cfg(unix)]
+    let host = fs::read_to_string("/etc/hostname").unwrap_or_default();
+    #[cfg(windows)]
+    let host = std::env::var("COMPUTERNAME").unwrap_or_default();
     let host = host.trim();
     json!({
         "device": if host.is_empty() { "Desktop".to_owned() } else { format!("Desktop ({host})") },
@@ -402,5 +407,13 @@ fn open(url: &str) -> Result<(), String> {
     if !["http", "https", "mailto"].contains(&scheme.as_str()) || url.chars().any(char::is_control) {
         return Err("not a link this app opens".into());
     }
-    Command::new("xdg-open").arg(url).spawn().map(drop).map_err(|e| e.to_string())
+    #[cfg(unix)]
+    let spawned = Command::new("xdg-open").arg(url).spawn();
+    // rundll32 hands the rest of its command line to the handler, so the URL goes in unquoted.
+    #[cfg(windows)]
+    let spawned = {
+        use std::os::windows::process::CommandExt;
+        Command::new("rundll32").arg("url.dll,FileProtocolHandler").raw_arg(url).spawn()
+    };
+    spawned.map(drop).map_err(|e| e.to_string())
 }

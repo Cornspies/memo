@@ -14,7 +14,7 @@ and that login replaces the device instead of adding one.
 
 - Rust with the `wasm32-unknown-unknown` target: `rustup target add wasm32-unknown-unknown`
 - The `wasm-bindgen` CLI at **exactly** the version pinned in `crates/wasm/Cargo.toml`:
-  `cargo install wasm-bindgen-cli --version 0.2.129 --locked`. Bump both together.
+  `cargo install wasm-bindgen-cli --version 0.2.130 --locked`. Bump both together.
 - [Bun](https://bun.sh) as the package manager. `bunfig.toml` installs exact versions only, and
   nothing published in the last two weeks.
 

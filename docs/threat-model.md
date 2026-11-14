@@ -34,7 +34,7 @@ and contact verification state are encrypted.
 
 - **Compromised or unlocked devices.** Native clients keep decrypted content in their local database
   so they can search it, and rely on OS disk encryption (Android file-based encryption, LUKS on
-  Linux). Malware on a device sees what the user sees.
+  Linux, BitLocker on Windows). Malware on a device sees what the user sees.
 - **Denial of service by the server operator.** The operator can always delete data. Keep backups.
 - **Traffic analysis** beyond the metadata above.
 

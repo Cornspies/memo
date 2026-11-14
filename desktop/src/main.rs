@@ -1,7 +1,10 @@
 //! The desktop app: the web UI (`web/`) in a Tauri window. The Rust side holds memo-core with its
-//! SQLite store (`memo-native`), does the HTTP and keeps the keys in the Secret Service; the
+//! SQLite store (`memo-native`), does the HTTP and keeps the keys in the OS keyring; the
 //! frontend's `NativeBackend` (`web/src/lib/native.ts`) drives it, offline-first, over one IPC
 //! command. See `desktop/README.md`.
+
+// No console window on Windows. Debug builds keep it for `--serve`.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod calls;
 #[cfg(debug_assertions)]
@@ -40,7 +43,8 @@ fn main() {
     }
     tauri::Builder::default()
         .setup(|app| {
-            let data_dir = app.path().app_data_dir()?;
+            // Not roaming on Windows (the same folder on Linux).
+            let data_dir = app.path().app_local_data_dir()?;
             let downloads = app.path().download_dir().unwrap_or_else(|_| data_dir.clone());
             let ctx = Ctx::new(data_dir, downloads, Secrets::Keyring)?;
             app.manage(ctx);

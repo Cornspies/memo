@@ -1,8 +1,8 @@
 # Pushing a tag like v0.2.0 for the version in Cargo.toml tests memo, builds everything that ships
 # and publishes a GitHub release with the files: memo-server (with the web app) and memo-desktop for
-# x86_64 and aarch64 Linux, the signed Android APK, and SHA256SUMS. The release notes are the tagged
-# commit's message, or GitHub's generated notes when the message has no body. A tag with a hyphen
-# (v0.2.0-rc1) becomes a pre-release.
+# x86_64 and aarch64 Linux, memo-desktop for x86_64 Windows, the signed Android APK, and SHA256SUMS.
+# The release notes are the tagged commit's message, or GitHub's generated notes when the message
+# has no body. A tag with a hyphen (v0.2.0-rc1) becomes a pre-release.
 #
 # Releases are built with the dependencies in the tagged commit's lockfiles (Cargo.lock, bun.lock,
 # gradle.lockfile): the versions that were developed and tested with. The Rust ones are checked
@@ -157,6 +157,38 @@ jobs:
           path: memo-*.tar.gz
           if-no-files-found: error
 
+  windows:
+    needs: web
+    runs-on: windows-2025
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install Rust
+        run: rustup update stable && rustup default stable
+      - uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7.0.0
+        with:
+          name: web-dist
+          path: web/dist
+      # The end-to-end tests run on Linux; these cover memo-core and the store on Windows.
+      - name: Unit tests
+        run: cargo test --locked -p memo-core -p memo-sqlite -p memo-native
+      - name: Build
+        run: cargo build --release --locked -p memo-desktop
+      - name: Package
+        shell: pwsh
+        run: |
+          $name = "memo-desktop-$($env:GITHUB_REF_NAME.Substring(1))-x86_64-windows"
+          New-Item -ItemType Directory $name | Out-Null
+          Copy-Item target/release/memo-desktop.exe, LICENSE, desktop/README.md $name
+          Compress-Archive $name "$name.zip"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: memo-windows-x86_64
+          path: memo-*.zip
+          if-no-files-found: error
+
   android:
     needs: check
     runs-on: ubuntu-24.04
@@ -188,7 +220,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: [test, build, android]
+    needs: [test, build, windows, android]
     runs-on: ubuntu-24.04
     permissions:
       contents: write

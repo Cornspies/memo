@@ -8,8 +8,8 @@ then the code, and keep them in sync.
 
 Done: `crates/core` (types, crypto, merge, sync engine), `crates/server` (axum + SQLite), `crates/wasm`
 and the web client (`web/`, online-only, see `web/README.md`), the Android app (`android/`,
-offline-first, see `android/README.md`) and the Linux desktop app (`desktop/`, offline-first, see
-`desktop/README.md`).
+offline-first, see `android/README.md`) and the desktop app for Linux and Windows (`desktop/`,
+offline-first, see `desktop/README.md`).
 
 - Both native apps share `crates/native`: one JSON call into `memo-core` with the rusqlite `Store`
   (`crates/sqlite`). Android reaches it over a hand-written JNI bridge (`crates/android`), the desktop
