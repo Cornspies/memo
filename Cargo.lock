@@ -2230,7 +2230,7 @@ checksum = "cf8baf1c55e62ffcace7a9f06f4bd9cd3f0c4beb022d3b367256b91b87513d98"
 
 [[package]]
 name = "memo-android"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "jni-sys 0.4.1",
  "memo-native",
@@ -2238,7 +2238,7 @@ dependencies = [
 
 [[package]]
 name = "memo-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "argon2",
  "base64 0.23.1",
@@ -2263,7 +2263,7 @@ dependencies = [
 
 [[package]]
 name = "memo-desktop"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "dbus-secret-service-keyring-store",
  "keyring-core",
@@ -2278,7 +2278,7 @@ dependencies = [
 
 [[package]]
 name = "memo-native"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "memo-core",
  "memo-sqlite",
@@ -2289,7 +2289,7 @@ dependencies = [
 
 [[package]]
 name = "memo-server"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "argon2",
  "axum",
@@ -2312,7 +2312,7 @@ dependencies = [
 
 [[package]]
 name = "memo-sqlite"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "memo-core",
  "rusqlite",
@@ -2323,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "memo-wasm"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "getrandom 0.4.3",
  "js-sys",
