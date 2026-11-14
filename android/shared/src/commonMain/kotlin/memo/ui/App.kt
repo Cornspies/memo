@@ -48,6 +48,9 @@ class AppState(val backend: Backend, val platform: Platform, val scope: Coroutin
     var theme by mutableStateOf(backend.theme)
 
     fun go(screen: Screen) {
+        // Back on a memo just created, it opens like any other, not in the editor.
+        val top = stack.last()
+        if (top is Screen.Memo && top.startEditing) stack[stack.lastIndex] = top.copy(startEditing = false)
         stack.add(screen)
     }
 

@@ -1,6 +1,6 @@
 {
   "productName": "memo",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "identifier": "memo.desktop",
   "build": {
     "frontendDist": "../web/dist"

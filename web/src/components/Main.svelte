@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { untrack } from "svelte";
   import {
     QUICK_FILTERS,
     app,
@@ -64,8 +65,15 @@
     }
   }
 
-  /** The memo just created opens in the editor. */
+  /** The memo just created opens in the editor. Once another one is open, it opens like any other. */
   let newId = $state<string | null>(null);
+  // Only on route changes: newMemo sets newId before the hash, and with it the route, changes.
+  $effect(() => {
+    const open = route.memo;
+    untrack(() => {
+      if (open !== newId) newId = null;
+    });
+  });
 
   function show(archived: boolean, tag: string | null) {
     clearFilter(archived);

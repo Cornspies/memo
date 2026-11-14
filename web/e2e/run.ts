@@ -318,6 +318,9 @@ try {
   await alice.until(`document.querySelector(".backlinks")?.innerText.includes("Index")`, "backlink");
   check(true, "a memo link opens its memo, which lists the backlink");
   await shot(alice, "07-links");
+  await alice.button("Index", ".backlinks");
+  await alice.until(`document.querySelector(".markdown h1")?.innerText === "Index" || document.querySelector("textarea.editor")?.value.startsWith("# Index")`, "back to Index");
+  check((await alice.count("textarea.editor")) === 0, "a memo just created opens out of the editor the next time");
 
   check((await alice.text(".items .group")) === "Today", "the list is grouped by day");
   await alice.button("Code", ".quick");
