@@ -11,3 +11,4 @@ build/
 # A local server's config and data (README.md, Build)
 /config.toml
 /memo-data
+.vscode/
