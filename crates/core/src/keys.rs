@@ -222,6 +222,20 @@ mod tests {
         assert_eq!(restored.public_key(), pair.public_key());
     }
 
+    /// Accounts registered before 0.2.2 hold the private key as generated, not clamped
+    /// (docs/crypto.md, User key pair). RFC 7748, section 6.1: Alice's private key is not clamped.
+    #[test]
+    fn unclamped_secret_is_the_same_key() {
+        let hex = |s: &str| (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect();
+        let secret: Vec<u8> = hex("77076d0a7318a57d3c16c17251b26645df4c2f87ebc0992ab177fba51db92c2a");
+        let public: Vec<u8> = hex("8520f0098930a754748b7ddcb43ef75a0dbf3a0d26381af4eba4a98eaa9b4e6a");
+        let pair = UserKeyPair::from_secret_bytes(&secret).unwrap();
+        assert_eq!(pair.public_key().as_bytes().as_slice(), public);
+        let clamped = pair.secret_bytes();
+        assert_ne!(clamped.as_slice(), secret);
+        assert_eq!(UserKeyPair::from_secret_bytes(&*clamped).unwrap().public_key(), pair.public_key());
+    }
+
     #[test]
     fn debug_never_prints_secrets() {
         let key = MemoKey::from_bytes(&[7u8; 32]).unwrap();

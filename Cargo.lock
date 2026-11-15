@@ -1583,12 +1583,13 @@ dependencies = [
 
 [[package]]
 name = "hpke"
-version = "0.14.1"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a5324110b02044183df000f0bd7d2d7e61f1000631508627e77f63983b6fdffb"
+checksum = "8f512e325a1a71bf3273fb9b7fc9e5d96dac136fb4a95d0e6637001b12ea3e09"
 dependencies = [
  "aead",
  "chacha20poly1305",
+ "curve25519-dalek",
  "getrandom 0.4.3",
  "hkdf 0.13.0",
  "hybrid-array",
@@ -1950,9 +1951,9 @@ dependencies = [
 
 [[package]]
 name = "jiff"
-version = "0.2.44"
+version = "0.2.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac63a5a611e9d720726d6ab6ee2ee19e6f620503554ea5d303c7cb294ff40c12"
+checksum = "34e6d07feb763c647199bd9072192b9639da3b5ffde49afd73c08b1d5ceb1469"
 dependencies = [
  "jiff-core",
  "jiff-static",
@@ -1966,18 +1967,18 @@ dependencies = [
 
 [[package]]
 name = "jiff-core"
-version = "0.1.6"
+version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48e9635854583b49ce3c6c43a071f70b0a49e79ad3c261c7b3aa76b2280416d2"
+checksum = "3c0dfb57e3485bee979b355302992ea9c38331a94f6ccce72c2bf0077d6c9310"
 dependencies = [
  "log",
 ]
 
 [[package]]
 name = "jiff-static"
-version = "0.2.44"
+version = "0.2.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f9c27796c21cc8b33ce490f148d53fe41d679b887885bf0ef8f662cdb9b35c0"
+checksum = "d93b8289f811027d18f228ae410cbadc766419d50b79185fa0084b10cc172d03"
 dependencies = [
  "jiff-core",
  "proc-macro2",
@@ -2303,7 +2304,7 @@ dependencies = [
  "sha2 0.11.1",
  "tokio",
  "tokio-util",
- "toml 0.9.12+spec-1.1.0",
+ "toml 1.2.1+spec-1.1.0",
  "tower",
  "tracing",
  "tracing-subscriber",
@@ -4457,19 +4458,6 @@ dependencies = [
 
 [[package]]
 name = "toml"
-version = "0.9.12+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "cf92845e79fc2e2def6a5d828f0801e29a2f8acc037becc5ab08595c7d5e9863"
-dependencies = [
- "serde_core",
- "serde_spanned 1.1.3",
- "toml_datetime 0.7.5+spec-1.1.0",
- "toml_parser",
- "winnow 0.7.15",
-]
-
-[[package]]
-name = "toml"
 version = "1.2.1+spec-1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d5755c51863cdac711f1956baf8eb9588e060755f7d3c4c979e70ea1e1f32cd7"
@@ -4490,15 +4478,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7cda73e2f1397b1262d6dfdcef8aafae14d1de7748d66822d3bfeeb6d03e5e4b"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "toml_datetime"
-version = "0.7.5+spec-1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92e1cfed4a3038bc5a127e35a2d360f145e1f4b971b551a2ba5fd7aedf7e1347"
-dependencies = [
- "serde_core",
 ]
 
 [[package]]
@@ -5410,12 +5389,6 @@ checksum = "f593a95398737aeed53e489c785df13f3618e41dbcd6718c6addbf1395aa6876"
 dependencies = [
  "memchr",
 ]
-
-[[package]]
-name = "winnow"
-version = "0.7.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
 
 [[package]]
 name = "winnow"

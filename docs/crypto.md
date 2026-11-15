@@ -115,6 +115,9 @@ An X25519 key pair is generated at registration. The private key is stored on th
 under `account_key`. After decrypting it, a client **recomputes the public key and compares it with the
 one the server holds**. A mismatch is a hard error.
 
+The private key is stored clamped (RFC 7748, section 5), as RFC 9180 serializes it. Accounts registered
+before 0.2.2 hold it as generated, unclamped: that is the same key, and clients take both.
+
 ## Memo keys and sharing
 
 Each memo has a sequence of 32-byte random keys, numbered by `key_version` starting at 1. The owner's
